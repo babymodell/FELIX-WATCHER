@@ -11,11 +11,19 @@ from dotenv import load_dotenv
 
 # -------------------- ENV --------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
+
+# .env ist NUR lokal praktisch. Auf Railway existiert sie meist nicht.
+# Das hier lädt .env, falls vorhanden, ohne Railway zu "brechen".
+dotenv_path = os.path.join(BASE_DIR, ".env")
+if os.path.exists(dotenv_path):
+    load_dotenv(dotenv_path)
+else:
+    # lädt ggf. eine .env aus dem Arbeitsverzeichnis, wenn vorhanden (harmlos)
+    load_dotenv()
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
-def env_int(key: str) -> int | None:
+def env_int(key: str):
     v = os.getenv(key)
     if not v:
         return None
@@ -38,7 +46,10 @@ ROLE_POLAND_ID = env_int("ROLE_POLAND_ID")
 ROLE_GERMANY_ID = env_int("ROLE_GERMANY_ID")
 
 if not TOKEN:
-    raise SystemExit("❌ DISCORD_BOT_TOKEN fehlt in .env")
+    raise SystemExit(
+        "❌ DISCORD_BOT_TOKEN fehlt. Setze ihn als Environment Variable "
+        "(z.B. Railway: Settings → Shared Variables → production)."
+    )
 
 # -------------------- DB (Mute Timer) --------------------
 DB_PATH = os.path.join(BASE_DIR, "bot.sqlite3")
@@ -69,15 +80,16 @@ join_method_cache = {}           # (guild_id, user_id) -> dict(method=..., invit
 
 # -------------------- Helpers --------------------
 def now_utc() -> datetime.datetime:
+    # Python 3.11+: datetime.UTC ist ok
     return datetime.datetime.now(datetime.UTC)
 
-async def get_text_channel(guild: discord.Guild, channel_id: int | None) -> discord.TextChannel | None:
+async def get_text_channel(guild: discord.Guild, channel_id):
     if not channel_id:
         return None
     ch = guild.get_channel(channel_id)
     return ch if isinstance(ch, discord.TextChannel) else None
 
-async def get_log_channel(guild: discord.Guild) -> discord.TextChannel | None:
+async def get_log_channel(guild: discord.Guild):
     return await get_text_channel(guild, LOG_CHANNEL_ID)
 
 def fmt_roles(member: discord.Member, limit: int = 18) -> str:
@@ -234,11 +246,11 @@ class RolePanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    async def _toggle_role(self, interaction: discord.Interaction, role_id: int | None):
+    async def _toggle_role(self, interaction: discord.Interaction, role_id):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
         if not role_id:
-            return await interaction.response.send_message("Role-ID fehlt in .env", ephemeral=True)
+            return await interaction.response.send_message("Role-ID fehlt in Env-Variablen.", ephemeral=True)
 
         role = interaction.guild.get_role(role_id)
         if not role:
@@ -408,7 +420,7 @@ async def ticket_setup(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
     if not TICKET_PANEL_CHANNEL_ID:
-        return await interaction.response.send_message("❌ TICKET_PANEL_CHANNEL_ID fehlt in .env", ephemeral=True)
+        return await interaction.response.send_message("❌ TICKET_PANEL_CHANNEL_ID fehlt in Env-Variablen", ephemeral=True)
 
     panel_ch = interaction.guild.get_channel(TICKET_PANEL_CHANNEL_ID)
     if not isinstance(panel_ch, discord.TextChannel):
@@ -424,7 +436,7 @@ async def role_setup(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
     if not ROLE_PANEL_CHANNEL_ID:
-        return await interaction.response.send_message("❌ ROLE_PANEL_CHANNEL_ID fehlt in .env", ephemeral=True)
+        return await interaction.response.send_message("❌ ROLE_PANEL_CHANNEL_ID fehlt in Env-Variablen", ephemeral=True)
 
     ch = interaction.guild.get_channel(ROLE_PANEL_CHANNEL_ID)
     if not isinstance(ch, discord.TextChannel):
@@ -452,14 +464,13 @@ async def mute(interaction: discord.Interaction, user: discord.Member, minuten: 
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
 
-    # ✅ FIX: sofort defer, damit Interaction nicht abläuft
     await interaction.response.defer(ephemeral=True)
 
     if user.guild_permissions.administrator:
         return await interaction.followup.send("❌ Admins kann ich nicht muten.", ephemeral=True)
 
     if not UNMUTE_CHANNEL_ID:
-        return await interaction.followup.send("❌ UNMUTE_CHANNEL_ID fehlt in .env", ephemeral=True)
+        return await interaction.followup.send("❌ UNMUTE_CHANNEL_ID fehlt in Env-Variablen", ephemeral=True)
 
     grund = grund or "Kein Grund angegeben"
 
@@ -719,7 +730,8 @@ async def on_ready():
     bot.add_view(TicketOpenView())
     bot.add_view(RolePanelView())
 
-    auto_unmute_loop.start()
+    if not auto_unmute_loop.is_running():
+        auto_unmute_loop.start()
 
     print(f"✅ Online als {bot.user} ({bot.user.id})")
 
