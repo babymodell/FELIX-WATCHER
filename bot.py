@@ -12,13 +12,11 @@ from dotenv import load_dotenv
 # -------------------- ENV --------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# .env ist NUR lokal praktisch. Auf Railway existiert sie meist nicht.
-# Das hier lädt .env, falls vorhanden, ohne Railway zu "brechen".
+# Lädt lokal .env (wenn vorhanden). Auf Railway kommen Variablen über das Dashboard.
 dotenv_path = os.path.join(BASE_DIR, ".env")
 if os.path.exists(dotenv_path):
     load_dotenv(dotenv_path)
 else:
-    # lädt ggf. eine .env aus dem Arbeitsverzeichnis, wenn vorhanden (harmlos)
     load_dotenv()
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -28,16 +26,34 @@ def env_int(key: str):
     if not v:
         return None
     try:
-        return int(v)
+        return int(v.strip())
     except ValueError:
         return None
+
+def env_int_list(key: str) -> list[int]:
+    """Erlaubt z.B. '1,2,3' bei TICKET_STAFF_ROLE_ID"""
+    v = os.getenv(key)
+    if not v:
+        return []
+    out: list[int] = []
+    for part in v.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except ValueError:
+            pass
+    return out
 
 WELCOME_CHANNEL_ID = env_int("WELCOME_CHANNEL_ID")
 LOG_CHANNEL_ID = env_int("LOG_CHANNEL_ID")
 
 TICKET_CATEGORY_ID = env_int("TICKET_CATEGORY_ID")
 TICKET_PANEL_CHANNEL_ID = env_int("TICKET_PANEL_CHANNEL_ID")
-TICKET_STAFF_ROLE_ID = env_int("TICKET_STAFF_ROLE_ID")
+
+# NOTE: In Railway Variable heißt sie weiter TICKET_STAFF_ROLE_ID (Komma-Liste möglich)
+TICKET_STAFF_ROLE_IDS = env_int_list("TICKET_STAFF_ROLE_ID")
 
 UNMUTE_CHANNEL_ID = env_int("UNMUTE_CHANNEL_ID")
 
@@ -46,10 +62,7 @@ ROLE_POLAND_ID = env_int("ROLE_POLAND_ID")
 ROLE_GERMANY_ID = env_int("ROLE_GERMANY_ID")
 
 if not TOKEN:
-    raise SystemExit(
-        "❌ DISCORD_BOT_TOKEN fehlt. Setze ihn als Environment Variable "
-        "(z.B. Railway: Settings → Shared Variables → production)."
-    )
+    raise SystemExit("❌ DISCORD_BOT_TOKEN fehlt als Environment Variable (Railway → Service → Variables).")
 
 # -------------------- DB (Mute Timer) --------------------
 DB_PATH = os.path.join(BASE_DIR, "bot.sqlite3")
@@ -80,7 +93,6 @@ join_method_cache = {}           # (guild_id, user_id) -> dict(method=..., invit
 
 # -------------------- Helpers --------------------
 def now_utc() -> datetime.datetime:
-    # Python 3.11+: datetime.UTC ist ok
     return datetime.datetime.now(datetime.UTC)
 
 async def get_text_channel(guild: discord.Guild, channel_id):
@@ -113,10 +125,13 @@ def discord_account_age(member: discord.Member) -> str:
 def is_staff(member: discord.Member) -> bool:
     if member.guild_permissions.administrator:
         return True
-    if not TICKET_STAFF_ROLE_ID:
+    if not TICKET_STAFF_ROLE_IDS:
         return False
-    role = member.guild.get_role(TICKET_STAFF_ROLE_ID)
-    return (role in member.roles) if role else False
+    for rid in TICKET_STAFF_ROLE_IDS:
+        role = member.guild.get_role(rid)
+        if role and role in member.roles:
+            return True
+    return False
 
 def staff_check():
     async def predicate(interaction: discord.Interaction) -> bool:
@@ -214,6 +229,7 @@ async def get_or_create_muted_role(guild: discord.Guild) -> discord.Role:
     return await guild.create_role(name=MUTED_ROLE_NAME, reason="Mute-System: Muted Rolle erstellt")
 
 async def apply_mute_overwrites(guild: discord.Guild, muted_role: discord.Role):
+    """Setzt Overwrites für ALLE Textchannels. Das ist langsam -> darum nur per /mute_setup einmal ausführen."""
     if not UNMUTE_CHANNEL_ID:
         raise RuntimeError("UNMUTE_CHANNEL_ID ist nicht gesetzt.")
     unmute_ch = guild.get_channel(UNMUTE_CHANNEL_ID)
@@ -355,8 +371,21 @@ class TicketManageView(discord.ui.View):
             await log_ch.send(f"🧾 Ticket claim: #{ch.name} von {interaction.user} ({interaction.user.id})")
 
 class TicketOpenView(discord.ui.View):
+    """Fix: Buttons + custom_id + timeout=None => Interaktionen funktionieren auch nach Restart (persistent view)."""
     def __init__(self):
         super().__init__(timeout=None)
+
+    @discord.ui.button(label="Question", style=discord.ButtonStyle.secondary, emoji="📌", custom_id="ticket_open:question")
+    async def question(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._create_ticket(interaction, "Question", "📌")
+
+    @discord.ui.button(label="Recruitment", style=discord.ButtonStyle.primary, emoji="📌", custom_id="ticket_open:recruitment")
+    async def recruitment(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._create_ticket(interaction, "Recruitment", "📌")
+
+    @discord.ui.button(label="Partnership", style=discord.ButtonStyle.success, emoji="📌", custom_id="ticket_open:partnership")
+    async def partnership(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._create_ticket(interaction, "Partnership", "📌")
 
     async def _create_ticket(self, interaction: discord.Interaction, kind: str, emoji: str):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
@@ -377,15 +406,18 @@ class TicketOpenView(discord.ui.View):
         ticket_no = await next_ticket_number(guild)
         channel_name = f"ticket-{ticket_no}"
 
+        staff_roles = [guild.get_role(rid) for rid in TICKET_STAFF_ROLE_IDS]
+        staff_roles = [r for r in staff_roles if r is not None]
+        staff_ping = " ".join(r.mention for r in staff_roles)
+
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
             member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
             guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True),
         }
 
-        staff_role = guild.get_role(TICKET_STAFF_ROLE_ID) if TICKET_STAFF_ROLE_ID else None
-        if staff_role:
-            overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+        for r in staff_roles:
+            overwrites[r] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
 
         topic = f"ticket_type={kind} | user_id={member.id} | claimed_by=none"
         ch = await guild.create_text_channel(
@@ -406,7 +438,7 @@ class TicketOpenView(discord.ui.View):
         embed.set_thumbnail(url=member.display_avatar.url)
 
         await ch.send(
-            content=(staff_role.mention if staff_role else ""),
+            content=staff_ping,
             embed=embed,
             view=TicketManageView(ticket_owner_id=member.id)
         )
@@ -457,6 +489,26 @@ async def role_setup(interaction: discord.Interaction):
     await ch.send(embed=embed, view=RolePanelView())
     await interaction.response.send_message(f"✅ Rollen-Panel gepostet in {ch.mention}", ephemeral=True)
 
+# ✅ NEU: Einmaliges Setup für schnelle mutes
+@bot.tree.command(name="mute_setup", description="Einmaliges Setup: setzt Muted-Rollen Overwrites (Staff/Admin)")
+@staff_check()
+async def mute_setup(interaction: discord.Interaction):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    if not UNMUTE_CHANNEL_ID:
+        return await interaction.followup.send("❌ UNMUTE_CHANNEL_ID fehlt in Env-Variablen", ephemeral=True)
+
+    muted_role = await get_or_create_muted_role(interaction.guild)
+    try:
+        await apply_mute_overwrites(interaction.guild, muted_role)
+    except Exception as e:
+        return await interaction.followup.send(f"❌ Setup Fehler: {e}", ephemeral=True)
+
+    await interaction.followup.send("✅ Mute-Setup fertig! Overwrites wurden gesetzt.", ephemeral=True)
+
 @bot.tree.command(name="mute", description="Mutet einen User (nur Unmute-Channel + eigene Tickets schreibbar)")
 @staff_check()
 @app_commands.describe(user="User", minuten="Dauer in Minuten (optional)", grund="Grund (optional)")
@@ -474,11 +526,9 @@ async def mute(interaction: discord.Interaction, user: discord.Member, minuten: 
 
     grund = grund or "Kein Grund angegeben"
 
+    # ✅ Fix für Speed: Overwrites NICHT mehr bei jedem mute setzen!
+    # Starte einmal /mute_setup nach dem Deploy.
     muted_role = await get_or_create_muted_role(interaction.guild)
-    try:
-        await apply_mute_overwrites(interaction.guild, muted_role)
-    except Exception as e:
-        return await interaction.followup.send(f"❌ Mute-Setup Fehler: {e}", ephemeral=True)
 
     if muted_role in user.roles:
         return await interaction.followup.send("✅ User ist bereits gemutet.", ephemeral=True)
@@ -727,8 +777,10 @@ async def on_guild_join(guild: discord.Guild):
 
 @bot.event
 async def on_ready():
+    # Persistent views registrieren (damit Buttons nach Restart funktionieren)
     bot.add_view(TicketOpenView())
     bot.add_view(RolePanelView())
+    bot.add_view(TicketManageView(ticket_owner_id=0))  # nur damit ticket:close/claim custom_ids registriert sind
 
     if not auto_unmute_loop.is_running():
         auto_unmute_loop.start()
