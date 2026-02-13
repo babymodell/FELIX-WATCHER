@@ -2,6 +2,7 @@ import os
 import asyncio
 import sqlite3
 import datetime
+import random
 from collections import defaultdict
 
 import discord
@@ -12,7 +13,7 @@ from dotenv import load_dotenv
 # -------------------- ENV --------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Lädt lokal .env (wenn vorhanden). Auf Railway kommen Variablen über das Dashboard.
+# Lokal: .env laden, auf Railway egal (da kommen Vars aus Environment)
 dotenv_path = os.path.join(BASE_DIR, ".env")
 if os.path.exists(dotenv_path):
     load_dotenv(dotenv_path)
@@ -20,6 +21,7 @@ else:
     load_dotenv()
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+
 
 def env_int(key: str):
     v = os.getenv(key)
@@ -30,8 +32,8 @@ def env_int(key: str):
     except ValueError:
         return None
 
+
 def env_int_list(key: str) -> list[int]:
-    """Erlaubt z.B. '1,2,3' bei TICKET_STAFF_ROLE_ID"""
     v = os.getenv(key)
     if not v:
         return []
@@ -46,13 +48,12 @@ def env_int_list(key: str) -> list[int]:
             pass
     return out
 
+
 WELCOME_CHANNEL_ID = env_int("WELCOME_CHANNEL_ID")
 LOG_CHANNEL_ID = env_int("LOG_CHANNEL_ID")
 
 TICKET_CATEGORY_ID = env_int("TICKET_CATEGORY_ID")
 TICKET_PANEL_CHANNEL_ID = env_int("TICKET_PANEL_CHANNEL_ID")
-
-# NOTE: In Railway Variable heißt sie weiter TICKET_STAFF_ROLE_ID (Komma-Liste möglich)
 TICKET_STAFF_ROLE_IDS = env_int_list("TICKET_STAFF_ROLE_ID")
 
 UNMUTE_CHANNEL_ID = env_int("UNMUTE_CHANNEL_ID")
@@ -62,10 +63,11 @@ ROLE_POLAND_ID = env_int("ROLE_POLAND_ID")
 ROLE_GERMANY_ID = env_int("ROLE_GERMANY_ID")
 
 if not TOKEN:
-    raise SystemExit("❌ DISCORD_BOT_TOKEN fehlt als Environment Variable (Railway → Service → Variables).")
+    raise SystemExit("❌ DISCORD_BOT_TOKEN fehlt als Environment Variable (Railway Variables).")
 
-# -------------------- DB (Mute Timer) --------------------
+# -------------------- DB --------------------
 DB_PATH = os.path.join(BASE_DIR, "bot.sqlite3")
+
 
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -77,32 +79,48 @@ def db():
             PRIMARY KEY (guild_id, user_id)
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS economy (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            balance INTEGER NOT NULL DEFAULT 0,
+            last_daily TEXT,
+            PRIMARY KEY (guild_id, user_id)
+        )
+    """)
     return conn
+
 
 # -------------------- BOT --------------------
 intents = discord.Intents.default()
-intents.members = True
+intents.members = True  # wichtig für join/leave, roles, moderation
+# message_content intent brauchst du nur für Prefix-Commands. Wir nutzen Slash.
+# intents.message_content = True  # optional
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 discord.utils.setup_logging()
 
-# -------------------- Invite Tracking --------------------
+# -------------------- Invite Tracking (optional) --------------------
 invite_cache = defaultdict(dict)  # guild_id -> {code: uses}
 vanity_cache = {}                # guild_id -> uses
 join_method_cache = {}           # (guild_id, user_id) -> dict(method=..., inviter=..., code=...)
+
 
 # -------------------- Helpers --------------------
 def now_utc() -> datetime.datetime:
     return datetime.datetime.now(datetime.UTC)
 
-async def get_text_channel(guild: discord.Guild, channel_id):
+
+async def get_text_channel(guild: discord.Guild, channel_id: int | None) -> discord.TextChannel | None:
     if not channel_id:
         return None
     ch = guild.get_channel(channel_id)
     return ch if isinstance(ch, discord.TextChannel) else None
 
-async def get_log_channel(guild: discord.Guild):
+
+async def get_log_channel(guild: discord.Guild) -> discord.TextChannel | None:
     return await get_text_channel(guild, LOG_CHANNEL_ID)
+
 
 def fmt_roles(member: discord.Member, limit: int = 18) -> str:
     roles = [r.mention for r in member.roles if r.name != "@everyone"]
@@ -111,6 +129,7 @@ def fmt_roles(member: discord.Member, limit: int = 18) -> str:
     if len(roles) > limit:
         return " ".join(roles[:limit]) + f" …(+{len(roles)-limit})"
     return " ".join(roles)
+
 
 def discord_account_age(member: discord.Member) -> str:
     days = (now_utc() - member.created_at).days
@@ -122,9 +141,12 @@ def discord_account_age(member: discord.Member) -> str:
         return f"vor {months} Monat(en)"
     return f"vor {days} Tag(en)"
 
+
 def is_staff(member: discord.Member) -> bool:
+    # Admin immer staff
     if member.guild_permissions.administrator:
         return True
+    # Wenn keine Staff Rollen gesetzt sind, gilt: kein Staff
     if not TICKET_STAFF_ROLE_IDS:
         return False
     for rid in TICKET_STAFF_ROLE_IDS:
@@ -132,6 +154,7 @@ def is_staff(member: discord.Member) -> bool:
         if role and role in member.roles:
             return True
     return False
+
 
 def staff_check():
     async def predicate(interaction: discord.Interaction) -> bool:
@@ -141,6 +164,7 @@ def staff_check():
             is_staff(interaction.user)
         )
     return app_commands.check(predicate)
+
 
 async def refresh_invites_for_guild(guild: discord.Guild):
     try:
@@ -156,6 +180,7 @@ async def refresh_invites_for_guild(guild: discord.Guild):
         vanity_cache[guild.id] = vanity_cache.get(guild.id, 0)
     except discord.HTTPException:
         pass
+
 
 async def detect_join_method(guild: discord.Guild) -> dict:
     used_code = None
@@ -185,12 +210,11 @@ async def detect_join_method(guild: discord.Guild) -> dict:
         vanity_cache[guild.id] = new_uses
         if new_uses > old_uses:
             return {"method": "vanity", "code": None, "inviter": None}
-    except discord.Forbidden:
-        pass
-    except discord.HTTPException:
+    except (discord.Forbidden, discord.HTTPException):
         pass
 
     return {"method": "unknown", "code": None, "inviter": None}
+
 
 # -------------------- Ticket Helpers --------------------
 async def ensure_ticket_category(guild: discord.Guild) -> discord.CategoryChannel:
@@ -201,12 +225,14 @@ async def ensure_ticket_category(guild: discord.Guild) -> discord.CategoryChanne
         raise RuntimeError("Ticket-Kategorie nicht gefunden. Prüfe TICKET_CATEGORY_ID.")
     return cat
 
+
 async def next_ticket_number(guild: discord.Guild) -> int:
     n = 1
     existing = {c.name for c in guild.text_channels}
     while f"ticket-{n}" in existing:
         n += 1
     return n
+
 
 def parse_topic(topic: str | None) -> dict:
     data = {}
@@ -219,8 +245,10 @@ def parse_topic(topic: str | None) -> dict:
             data[k.strip()] = v.strip()
     return data
 
+
 # -------------------- Mute System --------------------
 MUTED_ROLE_NAME = "Muted"
+
 
 async def get_or_create_muted_role(guild: discord.Guild) -> discord.Role:
     role = discord.utils.get(guild.roles, name=MUTED_ROLE_NAME)
@@ -228,8 +256,8 @@ async def get_or_create_muted_role(guild: discord.Guild) -> discord.Role:
         return role
     return await guild.create_role(name=MUTED_ROLE_NAME, reason="Mute-System: Muted Rolle erstellt")
 
+
 async def apply_mute_overwrites(guild: discord.Guild, muted_role: discord.Role):
-    """Setzt Overwrites für ALLE Textchannels. Das ist langsam -> darum nur per /mute_setup einmal ausführen."""
     if not UNMUTE_CHANNEL_ID:
         raise RuntimeError("UNMUTE_CHANNEL_ID ist nicht gesetzt.")
     unmute_ch = guild.get_channel(UNMUTE_CHANNEL_ID)
@@ -257,12 +285,13 @@ async def apply_mute_overwrites(guild: discord.Guild, muted_role: discord.Role):
         except discord.Forbidden:
             pass
 
+
 # -------------------- Role Panel --------------------
 class RolePanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    async def _toggle_role(self, interaction: discord.Interaction, role_id):
+    async def _toggle_role(self, interaction: discord.Interaction, role_id: int | None):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
         if not role_id:
@@ -290,6 +319,7 @@ class RolePanelView(discord.ui.View):
     @discord.ui.button(label="Germany", style=discord.ButtonStyle.secondary, emoji="🇩🇪", custom_id="rolepanel:germany")
     async def germany(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._toggle_role(interaction, ROLE_GERMANY_ID)
+
 
 # -------------------- Ticket Views --------------------
 class TicketManageView(discord.ui.View):
@@ -370,22 +400,10 @@ class TicketManageView(discord.ui.View):
         if log_ch:
             await log_ch.send(f"🧾 Ticket claim: #{ch.name} von {interaction.user} ({interaction.user.id})")
 
+
 class TicketOpenView(discord.ui.View):
-    """Fix: Buttons + custom_id + timeout=None => Interaktionen funktionieren auch nach Restart (persistent view)."""
     def __init__(self):
         super().__init__(timeout=None)
-
-    @discord.ui.button(label="Question", style=discord.ButtonStyle.secondary, emoji="📌", custom_id="ticket_open:question")
-    async def question(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._create_ticket(interaction, "Question", "📌")
-
-    @discord.ui.button(label="Recruitment", style=discord.ButtonStyle.primary, emoji="📌", custom_id="ticket_open:recruitment")
-    async def recruitment(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._create_ticket(interaction, "Recruitment", "📌")
-
-    @discord.ui.button(label="Partnership", style=discord.ButtonStyle.success, emoji="📌", custom_id="ticket_open:partnership")
-    async def partnership(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._create_ticket(interaction, "Partnership", "📌")
 
     async def _create_ticket(self, interaction: discord.Interaction, kind: str, emoji: str):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
@@ -399,6 +417,7 @@ class TicketOpenView(discord.ui.View):
         except Exception as e:
             return await interaction.response.send_message(f"❌ {e}", ephemeral=True)
 
+        # check: already has ticket
         for ch in guild.text_channels:
             if ch.topic and f"user_id={member.id}" in ch.topic and ch.category_id == category.id:
                 return await interaction.response.send_message(f"Du hast bereits ein Ticket: {ch.mention}", ephemeral=True)
@@ -406,16 +425,14 @@ class TicketOpenView(discord.ui.View):
         ticket_no = await next_ticket_number(guild)
         channel_name = f"ticket-{ticket_no}"
 
-        staff_roles = [guild.get_role(rid) for rid in TICKET_STAFF_ROLE_IDS]
-        staff_roles = [r for r in staff_roles if r is not None]
-        staff_ping = " ".join(r.mention for r in staff_roles)
-
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
             member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
             guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True),
         }
 
+        staff_roles = [guild.get_role(rid) for rid in TICKET_STAFF_ROLE_IDS]
+        staff_roles = [r for r in staff_roles if r is not None]
         for r in staff_roles:
             overwrites[r] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
 
@@ -437,6 +454,8 @@ class TicketOpenView(discord.ui.View):
         embed.add_field(name="Status", value="🟡 Open (not claimed)", inline=False)
         embed.set_thumbnail(url=member.display_avatar.url)
 
+        staff_ping = " ".join(r.mention for r in staff_roles)
+
         await ch.send(
             content=staff_ping,
             embed=embed,
@@ -445,7 +464,66 @@ class TicketOpenView(discord.ui.View):
 
         await interaction.response.send_message(f"✅ Ticket erstellt: {ch.mention}", ephemeral=True)
 
-# -------------------- Commands --------------------
+    @discord.ui.button(label="Question", style=discord.ButtonStyle.secondary, emoji="❓", custom_id="ticket_open:question")
+    async def question(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._create_ticket(interaction, "Question", "❓")
+
+    @discord.ui.button(label="Recruitment", style=discord.ButtonStyle.primary, emoji="📌", custom_id="ticket_open:recruitment")
+    async def recruitment(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._create_ticket(interaction, "Recruitment", "📌")
+
+    @discord.ui.button(label="Partnership", style=discord.ButtonStyle.success, emoji="🤝", custom_id="ticket_open:partnership")
+    async def partnership(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._create_ticket(interaction, "Partnership", "🤝")
+
+
+# -------------------- Economy Helpers --------------------
+def econ_get(guild_id: int, user_id: int) -> tuple[int, str | None]:
+    conn = db()
+    try:
+        row = conn.execute(
+            "SELECT balance, last_daily FROM economy WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id)
+        ).fetchone()
+        if not row:
+            conn.execute(
+                "INSERT OR IGNORE INTO economy(guild_id, user_id, balance, last_daily) VALUES (?, ?, 0, NULL)",
+                (guild_id, user_id)
+            )
+            conn.commit()
+            return 0, None
+        return int(row[0]), row[1]
+    finally:
+        conn.close()
+
+
+def econ_set_balance(guild_id: int, user_id: int, new_balance: int):
+    conn = db()
+    try:
+        conn.execute(
+            "INSERT INTO economy(guild_id, user_id, balance, last_daily) VALUES (?, ?, ?, NULL) "
+            "ON CONFLICT(guild_id, user_id) DO UPDATE SET balance=excluded.balance",
+            (guild_id, user_id, int(new_balance))
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def econ_set_daily(guild_id: int, user_id: int, last_daily_iso: str):
+    conn = db()
+    try:
+        conn.execute(
+            "INSERT INTO economy(guild_id, user_id, balance, last_daily) VALUES (?, ?, 0, ?) "
+            "ON CONFLICT(guild_id, user_id) DO UPDATE SET last_daily=excluded.last_daily",
+            (guild_id, user_id, last_daily_iso)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# -------------------- Commands: Setup Panels --------------------
 @bot.tree.command(name="ticket_setup", description="Postet das Ticket Panel (Staff/Admin)")
 @staff_check()
 async def ticket_setup(interaction: discord.Interaction):
@@ -461,6 +539,7 @@ async def ticket_setup(interaction: discord.Interaction):
     embed = discord.Embed(title="Tickets", description="Click below to create a new ticket", color=discord.Color.dark_grey())
     await panel_ch.send(embed=embed, view=TicketOpenView())
     await interaction.response.send_message(f"✅ Ticket-Panel gepostet in {panel_ch.mention}", ephemeral=True)
+
 
 @bot.tree.command(name="role_setup", description="Postet das Rollen-Panel (Staff/Admin)")
 @staff_check()
@@ -489,25 +568,132 @@ async def role_setup(interaction: discord.Interaction):
     await ch.send(embed=embed, view=RolePanelView())
     await interaction.response.send_message(f"✅ Rollen-Panel gepostet in {ch.mention}", ephemeral=True)
 
-# ✅ NEU: Einmaliges Setup für schnelle mutes
-@bot.tree.command(name="mute_setup", description="Einmaliges Setup: setzt Muted-Rollen Overwrites (Staff/Admin)")
+
+# -------------------- Commands: Ticket direct --------------------
+ticket_group = app_commands.Group(name="ticket", description="Ticket Commands")
+
+@ticket_group.command(name="create", description="Erstellt ein Support-Ticket")
+@app_commands.describe(typ="Typ: Question / Recruitment / Partnership")
+async def ticket_create(interaction: discord.Interaction, typ: str):
+    view = TicketOpenView()
+    typ_l = typ.lower().strip()
+    if typ_l in ("question", "frage"):
+        await view._create_ticket(interaction, "Question", "❓")
+    elif typ_l in ("recruitment", "bewerbung"):
+        await view._create_ticket(interaction, "Recruitment", "📌")
+    elif typ_l in ("partnership", "partner", "partnerschaft"):
+        await view._create_ticket(interaction, "Partnership", "🤝")
+    else:
+        await interaction.response.send_message("❌ Ungültiger Typ. Nutze: Question / Recruitment / Partnership", ephemeral=True)
+
+@ticket_group.command(name="close", description="Schließt dieses Ticket (löscht Channel)")
+async def ticket_close(interaction: discord.Interaction):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+    ch = interaction.channel
+    if not isinstance(ch, discord.TextChannel):
+        return await interaction.response.send_message("Nur im Ticket-Channel nutzbar.", ephemeral=True)
+
+    topic_data = parse_topic(ch.topic)
+    owner_id = int(topic_data.get("user_id", "0") or 0)
+    is_owner = owner_id == interaction.user.id
+    if not (is_owner or is_staff(interaction.user)):
+        return await interaction.response.send_message("❌ Du darfst dieses Ticket nicht schließen.", ephemeral=True)
+
+    await interaction.response.send_message("🔒 Ticket wird in **5 Sekunden** geschlossen…", ephemeral=True)
+    await asyncio.sleep(5)
+    try:
+        await ch.delete(reason=f"Ticket geschlossen von {interaction.user}")
+    except discord.Forbidden:
+        pass
+
+bot.tree.add_command(ticket_group)
+
+
+# -------------------- Commands: Moderation --------------------
+@bot.tree.command(name="clear", description="Löscht Nachrichten (max 100)")
+@app_commands.describe(anzahl="Anzahl (1-100)")
+async def clear(interaction: discord.Interaction, anzahl: int):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+    if not interaction.user.guild_permissions.manage_messages and not is_staff(interaction.user):
+        return await interaction.response.send_message("❌ Keine Rechte (Manage Messages).", ephemeral=True)
+    if not isinstance(interaction.channel, discord.TextChannel):
+        return await interaction.response.send_message("Ungültiger Channel.", ephemeral=True)
+
+    anzahl = max(1, min(100, anzahl))
+    await interaction.response.defer(ephemeral=True)
+    deleted = await interaction.channel.purge(limit=anzahl)
+    await interaction.followup.send(f"✅ Gelöscht: {len(deleted)} Nachricht(en).", ephemeral=True)
+
+
+@bot.tree.command(name="kick", description="Kickt einen User")
+@app_commands.describe(user="User", grund="Grund (optional)")
+async def kick(interaction: discord.Interaction, user: discord.Member, grund: str | None = None):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+    if not interaction.user.guild_permissions.kick_members and not is_staff(interaction.user):
+        return await interaction.response.send_message("❌ Keine Rechte (Kick Members).", ephemeral=True)
+
+    grund = grund or "—"
+    try:
+        await user.kick(reason=f"{grund} | by {interaction.user}")
+        await interaction.response.send_message(f"✅ {user} wurde gekickt. Grund: {grund}", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Bot hat keine Rechte zum Kicken.", ephemeral=True)
+
+
+@bot.tree.command(name="ban", description="Bannt einen User")
+@app_commands.describe(user="User", grund="Grund (optional)")
+async def ban(interaction: discord.Interaction, user: discord.Member, grund: str | None = None):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+    if not interaction.user.guild_permissions.ban_members and not is_staff(interaction.user):
+        return await interaction.response.send_message("❌ Keine Rechte (Ban Members).", ephemeral=True)
+
+    grund = grund or "—"
+    try:
+        await user.ban(reason=f"{grund} | by {interaction.user}")
+        await interaction.response.send_message(f"✅ {user} wurde gebannt. Grund: {grund}", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Bot hat keine Rechte zum Bannen.", ephemeral=True)
+
+
+@bot.tree.command(name="timeout", description="Timeout für einen User (Minuten)")
+@app_commands.describe(user="User", minuten="Dauer in Minuten", grund="Grund (optional)")
+async def timeout(interaction: discord.Interaction, user: discord.Member, minuten: int, grund: str | None = None):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+    if not interaction.user.guild_permissions.moderate_members and not is_staff(interaction.user):
+        return await interaction.response.send_message("❌ Keine Rechte (Moderate Members).", ephemeral=True)
+
+    minuten = max(1, min(10080, minuten))  # max 7 Tage
+    until = now_utc() + datetime.timedelta(minutes=minuten)
+    grund = grund or "—"
+
+    try:
+        await user.timeout(until, reason=f"{grund} | by {interaction.user}")
+        await interaction.response.send_message(f"✅ Timeout gesetzt für {user.mention}: {minuten} Minuten.", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Bot hat keine Rechte für Timeout.", ephemeral=True)
+
+
+# -------------------- Commands: Mute --------------------
+@bot.tree.command(name="mute_setup", description="Einmaliges Setup: Muted Rolle + Overwrites (Staff/Admin)")
 @staff_check()
 async def mute_setup(interaction: discord.Interaction):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+    if not interaction.guild:
         return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
 
     await interaction.response.defer(ephemeral=True)
-
-    if not UNMUTE_CHANNEL_ID:
-        return await interaction.followup.send("❌ UNMUTE_CHANNEL_ID fehlt in Env-Variablen", ephemeral=True)
-
     muted_role = await get_or_create_muted_role(interaction.guild)
     try:
         await apply_mute_overwrites(interaction.guild, muted_role)
     except Exception as e:
-        return await interaction.followup.send(f"❌ Setup Fehler: {e}", ephemeral=True)
+        return await interaction.followup.send(f"❌ Fehler: {e}", ephemeral=True)
 
-    await interaction.followup.send("✅ Mute-Setup fertig! Overwrites wurden gesetzt.", ephemeral=True)
+    await interaction.followup.send("✅ Mute-Setup abgeschlossen (Muted-Rolle & Overwrites).", ephemeral=True)
+
 
 @bot.tree.command(name="mute", description="Mutet einen User (nur Unmute-Channel + eigene Tickets schreibbar)")
 @staff_check()
@@ -526,9 +712,11 @@ async def mute(interaction: discord.Interaction, user: discord.Member, minuten: 
 
     grund = grund or "Kein Grund angegeben"
 
-    # ✅ Fix für Speed: Overwrites NICHT mehr bei jedem mute setzen!
-    # Starte einmal /mute_setup nach dem Deploy.
     muted_role = await get_or_create_muted_role(interaction.guild)
+    try:
+        await apply_mute_overwrites(interaction.guild, muted_role)
+    except Exception as e:
+        return await interaction.followup.send(f"❌ Mute-Setup Fehler: {e}", ephemeral=True)
 
     if muted_role in user.roles:
         return await interaction.followup.send("✅ User ist bereits gemutet.", ephemeral=True)
@@ -557,31 +745,20 @@ async def mute(interaction: discord.Interaction, user: discord.Member, minuten: 
     unmute_hint = f"#{unmute_ch.name}" if isinstance(unmute_ch, discord.TextChannel) else "den Unmute-Channel"
     dauer_txt = f"{minuten} Minuten" if (minuten and minuten > 0) else "unbestimmt"
 
-    dm_text = (
-        f"🔇 Du wurdest auf **{interaction.guild.name}** gemutet.\n"
-        f"👮 Von: {interaction.user}\n"
-        f"📝 Grund: {grund}\n"
-        f"⏳ Dauer: {dauer_txt}\n\n"
-        f"✅ Du kannst **nur** im **{unmute_hint}** schreiben (für Unmute) "
-        f"und **in deinen eigenen Ticket-Channels**."
-    )
     try:
-        await user.send(dm_text)
+        await user.send(
+            f"🔇 Du wurdest auf **{interaction.guild.name}** gemutet.\n"
+            f"👮 Von: {interaction.user}\n"
+            f"📝 Grund: {grund}\n"
+            f"⏳ Dauer: {dauer_txt}\n\n"
+            f"✅ Du kannst **nur** im **{unmute_hint}** schreiben (für Unmute) "
+            f"und **in deinen eigenen Ticket-Channels**."
+        )
     except:
         pass
 
     await interaction.followup.send(f"🔇 {user.mention} wurde gemutet. Dauer: {dauer_txt}", ephemeral=True)
 
-    log_ch = await get_log_channel(interaction.guild)
-    if log_ch:
-        emb = discord.Embed(title="User muted", color=discord.Color.orange())
-        emb.set_author(name=str(user), icon_url=user.display_avatar.url)
-        emb.set_thumbnail(url=user.display_avatar.url)
-        emb.add_field(name="User", value=f"{user.mention} ({user.id})", inline=False)
-        emb.add_field(name="Moderator", value=interaction.user.mention, inline=False)
-        emb.add_field(name="Reason", value=grund, inline=False)
-        emb.add_field(name="Duration", value=dauer_txt, inline=False)
-        await log_ch.send(embed=emb)
 
 @bot.tree.command(name="unmute", description="Entmutet einen User")
 @staff_check()
@@ -612,14 +789,167 @@ async def unmute(interaction: discord.Interaction, user: discord.Member):
 
     await interaction.response.send_message(f"✅ {user.mention} wurde entmutet.", ephemeral=True)
 
-    log_ch = await get_log_channel(interaction.guild)
-    if log_ch:
-        emb = discord.Embed(title="User unmuted", color=discord.Color.green())
-        emb.set_author(name=str(user), icon_url=user.display_avatar.url)
-        emb.set_thumbnail(url=user.display_avatar.url)
-        emb.add_field(name="User", value=f"{user.mention} ({user.id})", inline=False)
-        emb.add_field(name="Moderator", value=interaction.user.mention, inline=False)
-        await log_ch.send(embed=emb)
+
+# -------------------- Economy Commands --------------------
+@bot.tree.command(name="balance", description="Zeigt den Kontostand")
+@app_commands.describe(user="User (optional)")
+async def balance(interaction: discord.Interaction, user: discord.Member | None = None):
+    if not interaction.guild:
+        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+    user = user or interaction.user
+    bal, _ = econ_get(interaction.guild.id, user.id)
+    await interaction.response.send_message(f"💰 {user.mention} hat **{bal}** Coins.", ephemeral=True)
+
+
+@bot.tree.command(name="daily", description="Tägliche Coins abholen (alle 24h)")
+async def daily(interaction: discord.Interaction):
+    if not interaction.guild:
+        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+
+    guild_id = interaction.guild.id
+    user_id = interaction.user.id
+    bal, last = econ_get(guild_id, user_id)
+
+    now = now_utc()
+    if last:
+        try:
+            last_dt = datetime.datetime.fromisoformat(last)
+            if now - last_dt < datetime.timedelta(hours=24):
+                remaining = datetime.timedelta(hours=24) - (now - last_dt)
+                hours = int(remaining.total_seconds() // 3600)
+                mins = int((remaining.total_seconds() % 3600) // 60)
+                return await interaction.response.send_message(
+                    f"⏳ Daily schon benutzt. Warte noch **{hours}h {mins}m**.",
+                    ephemeral=True
+                )
+        except:
+            pass
+
+    reward = random.randint(50, 150)
+    econ_set_balance(guild_id, user_id, bal + reward)
+    econ_set_daily(guild_id, user_id, now.isoformat())
+    await interaction.response.send_message(f"✅ Daily erhalten: **+{reward}** Coins. (Neu: {bal + reward})", ephemeral=True)
+
+
+@bot.tree.command(name="pay", description="Zahle Coins an einen User")
+@app_commands.describe(user="Empfänger", amount="Betrag")
+async def pay(interaction: discord.Interaction, user: discord.Member, amount: int):
+    if not interaction.guild:
+        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+    if user.id == interaction.user.id:
+        return await interaction.response.send_message("❌ Du kannst dir nicht selbst Coins zahlen.", ephemeral=True)
+    if amount <= 0:
+        return await interaction.response.send_message("❌ Betrag muss > 0 sein.", ephemeral=True)
+
+    guild_id = interaction.guild.id
+    sender_id = interaction.user.id
+    recv_id = user.id
+
+    sender_bal, _ = econ_get(guild_id, sender_id)
+    recv_bal, _ = econ_get(guild_id, recv_id)
+
+    if sender_bal < amount:
+        return await interaction.response.send_message("❌ Nicht genug Coins.", ephemeral=True)
+
+    econ_set_balance(guild_id, sender_id, sender_bal - amount)
+    econ_set_balance(guild_id, recv_id, recv_bal + amount)
+
+    await interaction.response.send_message(
+        f"✅ {interaction.user.mention} hat **{amount}** Coins an {user.mention} gezahlt.",
+        ephemeral=False
+    )
+
+
+# -------------------- Fun/Info Commands --------------------
+@bot.tree.command(name="ping", description="Zeigt die Bot-Latenz")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message(f"🏓 Pong: **{round(bot.latency*1000)}ms**", ephemeral=True)
+
+
+@bot.tree.command(name="info", description="Kurze Info über den Bot")
+async def info(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        f"🤖 **{bot.user}**\n"
+        f"Servers: **{len(bot.guilds)}**\n"
+        f"Latency: **{round(bot.latency*1000)}ms**",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="helpme", description="Zeigt eine Befehlsübersicht")
+async def helpme(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "✅ **Commands**\n"
+        "Moderation: /clear /kick /ban /timeout /mute /unmute /mute_setup\n"
+        "Tickets: /ticket_setup /ticket create /ticket close\n"
+        "Roles: /role_setup\n"
+        "Economy: /balance /daily /pay\n"
+        "Fun: /roll /coinflip /8ball\n"
+        "Info: /ping /info /avatar /userinfo /serverinfo",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="avatar", description="Zeigt den Avatar eines Users")
+@app_commands.describe(user="User (optional)")
+async def avatar(interaction: discord.Interaction, user: discord.Member | None = None):
+    user = user or interaction.user
+    await interaction.response.send_message(user.display_avatar.url, ephemeral=True)
+
+
+@bot.tree.command(name="userinfo", description="Infos über einen User")
+@app_commands.describe(user="User (optional)")
+async def userinfo(interaction: discord.Interaction, user: discord.Member | None = None):
+    if not interaction.guild:
+        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+    user = user or interaction.user
+    emb = discord.Embed(title="Userinfo", color=discord.Color.blurple())
+    emb.set_thumbnail(url=user.display_avatar.url)
+    emb.add_field(name="User", value=f"{user} ({user.id})", inline=False)
+    emb.add_field(name="Joined Server", value=user.joined_at.strftime("%d.%m.%Y %H:%M") if user.joined_at else "—", inline=False)
+    emb.add_field(name="Created", value=user.created_at.strftime("%d.%m.%Y %H:%M"), inline=False)
+    emb.add_field(name="Roles", value=fmt_roles(user), inline=False)
+    await interaction.response.send_message(embed=emb, ephemeral=True)
+
+
+@bot.tree.command(name="serverinfo", description="Infos über den Server")
+async def serverinfo(interaction: discord.Interaction):
+    if not interaction.guild:
+        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+    g = interaction.guild
+    emb = discord.Embed(title="Serverinfo", color=discord.Color.green())
+    if g.icon:
+        emb.set_thumbnail(url=g.icon.url)
+    emb.add_field(name="Name", value=g.name, inline=False)
+    emb.add_field(name="ID", value=str(g.id), inline=False)
+    emb.add_field(name="Members", value=str(g.member_count), inline=False)
+    emb.add_field(name="Owner", value=str(g.owner), inline=False)
+    await interaction.response.send_message(embed=emb, ephemeral=True)
+
+
+@bot.tree.command(name="roll", description="Würfeln (Standard 1-100)")
+@app_commands.describe(maximum="Max (optional)")
+async def roll(interaction: discord.Interaction, maximum: int | None = None):
+    maximum = maximum or 100
+    maximum = max(1, min(100000, maximum))
+    value = random.randint(1, maximum)
+    await interaction.response.send_message(f"🎲 {interaction.user.mention} rolled **{value}** (1-{maximum})")
+
+
+@bot.tree.command(name="coinflip", description="Kopf oder Zahl")
+async def coinflip(interaction: discord.Interaction):
+    await interaction.response.send_message(f"🪙 Ergebnis: **{random.choice(['Kopf', 'Zahl'])}**")
+
+
+@bot.tree.command(name="8ball", description="Magic 8 Ball")
+@app_commands.describe(frage="Deine Frage")
+async def eightball(interaction: discord.Interaction, frage: str):
+    answers = [
+        "Ja.", "Nein.", "Vielleicht.", "Sehr wahrscheinlich.", "Unwahrscheinlich.",
+        "Frag später nochmal.", "Ich glaube schon.", "Auf keinen Fall.", "Sieht gut aus.", "Keine Ahnung."
+    ]
+    await interaction.response.send_message(f"🎱 Frage: **{frage}**\nAntwort: **{random.choice(answers)}**")
+
 
 # -------------------- Auto Unmute Loop --------------------
 @tasks.loop(seconds=30)
@@ -650,19 +980,6 @@ async def auto_unmute_loop():
                     await member.remove_roles(muted_role, reason="Auto-Unmute (Timer)")
                 except:
                     pass
-                try:
-                    await member.send(f"✅ Du wurdest auf **{guild.name}** automatisch entmutet (Dauer abgelaufen).")
-                except:
-                    pass
-
-                log_ch = await get_log_channel(guild)
-                if log_ch:
-                    emb = discord.Embed(title="User unmuted (auto)", color=discord.Color.green())
-                    emb.set_author(name=str(member), icon_url=member.display_avatar.url)
-                    emb.set_thumbnail(url=member.display_avatar.url)
-                    emb.add_field(name="User", value=f"{member.mention} ({member.id})", inline=False)
-                    emb.add_field(name="Reason", value="Timer abgelaufen", inline=False)
-                    await log_ch.send(embed=emb)
 
             conn2 = db()
             try:
@@ -671,11 +988,13 @@ async def auto_unmute_loop():
             finally:
                 conn2.close()
 
+
 @auto_unmute_loop.before_loop
 async def before_auto_unmute():
     await bot.wait_until_ready()
 
-# -------------------- Events: Welcome + Logs --------------------
+
+# -------------------- Events --------------------
 @bot.event
 async def on_member_join(member: discord.Member):
     welcome_ch = await get_text_channel(member.guild, WELCOME_CHANNEL_ID)
@@ -719,6 +1038,7 @@ async def on_member_join(member: discord.Member):
 
         await log_ch.send(embed=emb)
 
+
 @bot.event
 async def on_member_remove(member: discord.Member):
     log_ch = await get_log_channel(member.guild)
@@ -742,45 +1062,17 @@ async def on_member_remove(member: discord.Member):
     emb.add_field(name="Joined via", value=join_txt, inline=False)
     await log_ch.send(embed=emb)
 
-@bot.event
-async def on_member_ban(guild: discord.Guild, user: discord.User):
-    log_ch = await get_log_channel(guild)
-    if not log_ch:
-        return
 
-    moderator = None
-    reason = None
-    try:
-        async for entry in guild.audit_logs(limit=6, action=discord.AuditLogAction.ban):
-            if entry.target and entry.target.id == user.id:
-                moderator = entry.user
-                reason = entry.reason
-                break
-    except discord.Forbidden:
-        pass
-
-    emb = discord.Embed(title="User has been banned", color=discord.Color.red())
-    try:
-        emb.set_thumbnail(url=user.display_avatar.url)
-    except:
-        pass
-
-    emb.add_field(name="User", value=f"<@{user.id}> ({user.id})", inline=False)
-    emb.add_field(name="Moderator", value=(moderator.mention if moderator else "Unknown"), inline=False)
-    emb.add_field(name="Reason", value=(reason or "—"), inline=False)
-    await log_ch.send(embed=emb)
-
-# -------------------- Startup --------------------
 @bot.event
 async def on_guild_join(guild: discord.Guild):
     await refresh_invites_for_guild(guild)
 
+
 @bot.event
 async def on_ready():
-    # Persistent views registrieren (damit Buttons nach Restart funktionieren)
+    # Persistente Views (Buttons funktionieren nach Restart)
     bot.add_view(TicketOpenView())
     bot.add_view(RolePanelView())
-    bot.add_view(TicketManageView(ticket_owner_id=0))  # nur damit ticket:close/claim custom_ids registriert sind
 
     if not auto_unmute_loop.is_running():
         auto_unmute_loop.start()
@@ -794,5 +1086,6 @@ async def on_ready():
         await bot.tree.sync()
     except Exception as e:
         print("Sync error:", e)
+
 
 bot.run(TOKEN)
