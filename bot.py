@@ -14,7 +14,6 @@ from dotenv import load_dotenv
 # -------------------- ENV --------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Lokal: .env laden, auf Railway egal (da kommen Vars aus Environment)
 dotenv_path = os.path.join(BASE_DIR, ".env")
 if os.path.exists(dotenv_path):
     load_dotenv(dotenv_path)
@@ -63,33 +62,46 @@ ROLE_PANEL_CHANNEL_ID = env_int("ROLE_PANEL_CHANNEL_ID")
 ROLE_POLAND_ID = env_int("ROLE_POLAND_ID")
 ROLE_GERMANY_ID = env_int("ROLE_GERMANY_ID")
 
-# Ticket Transcript Limit (optional)
 TRANSCRIPT_LIMIT = env_int("TICKET_TRANSCRIPT_LIMIT") or 200
 
-# -------------------- MARKET (Berlin/Polen getrennt) --------------------
-# ENV:
-# MARKET_BERLIN_CATEGORY_ID=...
+# -------------------- MARKET (Threads, keine extra Channels) --------------------
+# Pflicht:
 # MARKET_BERLIN_PANEL_CHANNEL_ID=...
 # MARKET_BERLIN_LISTINGS_CHANNEL_ID=...
-# MARKET_BERLIN_STAFF_ROLE_ID=1,2,3   (optional)
-#
-# MARKET_POLAND_CATEGORY_ID=...
 # MARKET_POLAND_PANEL_CHANNEL_ID=...
 # MARKET_POLAND_LISTINGS_CHANNEL_ID=...
-# MARKET_POLAND_STAFF_ROLE_ID=4,5,6   (optional)
-MARKET_BERLIN_CATEGORY_ID = env_int("MARKET_BERLIN_CATEGORY_ID")
+#
+# Optional:
+# MARKET_BERLIN_STAFF_ROLE_ID=1,2,3
+# MARKET_POLAND_STAFF_ROLE_ID=4,5,6
 MARKET_BERLIN_PANEL_CHANNEL_ID = env_int("MARKET_BERLIN_PANEL_CHANNEL_ID")
 MARKET_BERLIN_LISTINGS_CHANNEL_ID = env_int("MARKET_BERLIN_LISTINGS_CHANNEL_ID")
 MARKET_BERLIN_STAFF_ROLE_IDS = env_int_list("MARKET_BERLIN_STAFF_ROLE_ID")
 
-MARKET_POLAND_CATEGORY_ID = env_int("MARKET_POLAND_CATEGORY_ID")
 MARKET_POLAND_PANEL_CHANNEL_ID = env_int("MARKET_POLAND_PANEL_CHANNEL_ID")
 MARKET_POLAND_LISTINGS_CHANNEL_ID = env_int("MARKET_POLAND_LISTINGS_CHANNEL_ID")
 MARKET_POLAND_STAFF_ROLE_IDS = env_int_list("MARKET_POLAND_STAFF_ROLE_ID")
 
-# Wer darf wo posten? (wie du wolltest: Berlin-Rolle & Polen-Rolle separat)
+# Wer darf wo posten (separat):
 MARKET_ALLOWED_ROLE_BERLIN = ROLE_GERMANY_ID
 MARKET_ALLOWED_ROLE_POLAND = ROLE_POLAND_ID
+
+MARKET_CFG = {
+    "berlin": {
+        "label": "Berlin",
+        "allowed_role_id": MARKET_ALLOWED_ROLE_BERLIN,
+        "panel_channel_id": MARKET_BERLIN_PANEL_CHANNEL_ID,
+        "listings_channel_id": MARKET_BERLIN_LISTINGS_CHANNEL_ID,
+        "staff_role_ids": MARKET_BERLIN_STAFF_ROLE_IDS,
+    },
+    "poland": {
+        "label": "Polen",
+        "allowed_role_id": MARKET_ALLOWED_ROLE_POLAND,
+        "panel_channel_id": MARKET_POLAND_PANEL_CHANNEL_ID,
+        "listings_channel_id": MARKET_POLAND_LISTINGS_CHANNEL_ID,
+        "staff_role_ids": MARKET_POLAND_STAFF_ROLE_IDS,
+    }
+}
 
 if not TOKEN:
     raise SystemExit("❌ DISCORD_BOT_TOKEN fehlt als Environment Variable (Railway Variables).")
@@ -122,12 +134,12 @@ def db():
 
 # -------------------- BOT --------------------
 intents = discord.Intents.default()
-intents.members = True  # wichtig für join/leave, roles, moderation
+intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 discord.utils.setup_logging()
 
-# -------------------- Invite Tracking (optional) --------------------
+# -------------------- Invite Tracking --------------------
 invite_cache = defaultdict(dict)  # guild_id -> {code: uses}
 vanity_cache = {}                # guild_id -> uses
 join_method_cache = {}           # (guild_id, user_id) -> dict(method=..., inviter=..., code=...)
@@ -294,6 +306,64 @@ async def detect_join_method(guild: discord.Guild) -> dict:
     return {"method": "unknown", "code": None, "inviter": None}
 
 
+def parse_topic(topic: str | None) -> dict:
+    data = {}
+    if not topic:
+        return data
+    parts = [p.strip() for p in topic.split("|")]
+    for p in parts:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            data[k.strip()] = v.strip()
+    return data
+
+
+async def build_text_channel_transcript(channel: discord.TextChannel, limit: int = 200) -> str:
+    lines: list[str] = []
+    lines.append(f"Transcript for #{channel.name} ({channel.id})")
+    lines.append(f"Guild: {channel.guild.name} ({channel.guild.id})")
+    lines.append(f"Exported at: {now_utc().isoformat()} UTC")
+    if channel.topic:
+        lines.append(f"Topic: {channel.topic}")
+    lines.append("-" * 80)
+
+    try:
+        async for msg in channel.history(limit=limit, oldest_first=True):
+            ts = msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+            author = f"{msg.author} ({msg.author.id})"
+            content = (msg.content or "").replace("\n", "\\n")
+            lines.append(f"[{ts}] {author}: {content}")
+            for a in msg.attachments:
+                lines.append(f"  [Attachment] {a.url}")
+    except Exception as e:
+        lines.append(f"[Transcript error] {e}")
+
+    lines.append("-" * 80)
+    return "\n".join(lines)
+
+
+async def build_thread_transcript(thread: discord.Thread, limit: int = 200) -> str:
+    lines: list[str] = []
+    lines.append(f"Transcript for Thread {thread.name} ({thread.id})")
+    lines.append(f"Guild: {thread.guild.name} ({thread.guild.id})")
+    lines.append(f"Exported at: {now_utc().isoformat()} UTC")
+    lines.append("-" * 80)
+
+    try:
+        async for msg in thread.history(limit=limit, oldest_first=True):
+            ts = msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+            author = f"{msg.author} ({msg.author.id})"
+            content = (msg.content or "").replace("\n", "\\n")
+            lines.append(f"[{ts}] {author}: {content}")
+            for a in msg.attachments:
+                lines.append(f"  [Attachment] {a.url}")
+    except Exception as e:
+        lines.append(f"[Transcript error] {e}")
+
+    lines.append("-" * 80)
+    return "\n".join(lines)
+
+
 # -------------------- Ticket Helpers --------------------
 async def ensure_ticket_category(guild: discord.Guild) -> discord.CategoryChannel:
     if not TICKET_CATEGORY_ID:
@@ -310,95 +380,6 @@ async def next_ticket_number(guild: discord.Guild) -> int:
     while f"ticket-{n}" in existing:
         n += 1
     return n
-
-
-def parse_topic(topic: str | None) -> dict:
-    data = {}
-    if not topic:
-        return data
-    parts = [p.strip() for p in topic.split("|")]
-    for p in parts:
-        if "=" in p:
-            k, v = p.split("=", 1)
-            data[k.strip()] = v.strip()
-    return data
-
-
-async def build_ticket_transcript(channel: discord.TextChannel, limit: int = 200) -> str:
-    lines: list[str] = []
-    lines.append(f"Transcript for #{channel.name} ({channel.id})")
-    lines.append(f"Guild: {channel.guild.name} ({channel.guild.id})")
-    lines.append(f"Exported at: {now_utc().isoformat()} UTC")
-    if channel.topic:
-        lines.append(f"Topic: {channel.topic}")
-    lines.append("-" * 80)
-
-    try:
-        async for msg in channel.history(limit=limit, oldest_first=True):
-            ts = msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
-            author = f"{msg.author} ({msg.author.id})"
-            content = (msg.content or "").replace("\n", "\\n")
-            lines.append(f"[{ts}] {author}: {content}")
-
-            if msg.attachments:
-                for a in msg.attachments:
-                    lines.append(f"  [Attachment] {a.url}")
-
-            if msg.embeds:
-                for e in msg.embeds:
-                    title = (e.title or "").strip().replace("\n", "\\n")
-                    desc = (e.description or "").strip().replace("\n", "\\n")
-                    if title or desc:
-                        lines.append(f"  [Embed] title={title!r} desc={desc[:300]!r}")
-
-    except Exception as e:
-        lines.append("")
-        lines.append(f"[Transcript error] {e}")
-
-    lines.append("-" * 80)
-    return "\n".join(lines)
-
-
-# -------------------- MARKET Helpers --------------------
-MARKET_CFG = {
-    "berlin": {
-        "label": "Berlin",
-        "allowed_role_id": MARKET_ALLOWED_ROLE_BERLIN,
-        "category_id": MARKET_BERLIN_CATEGORY_ID,
-        "panel_channel_id": MARKET_BERLIN_PANEL_CHANNEL_ID,
-        "listings_channel_id": MARKET_BERLIN_LISTINGS_CHANNEL_ID,
-        "staff_role_ids": MARKET_BERLIN_STAFF_ROLE_IDS,
-    },
-    "poland": {
-        "label": "Polen",
-        "allowed_role_id": MARKET_ALLOWED_ROLE_POLAND,
-        "category_id": MARKET_POLAND_CATEGORY_ID,
-        "panel_channel_id": MARKET_POLAND_PANEL_CHANNEL_ID,
-        "listings_channel_id": MARKET_POLAND_LISTINGS_CHANNEL_ID,
-        "staff_role_ids": MARKET_POLAND_STAFF_ROLE_IDS,
-    }
-}
-
-
-async def ensure_market_category(guild: discord.Guild, category_id: int | None) -> discord.CategoryChannel:
-    if not category_id:
-        raise RuntimeError("Market-Kategorie-ID ist nicht gesetzt.")
-    cat = guild.get_channel(category_id)
-    if not isinstance(cat, discord.CategoryChannel):
-        raise RuntimeError("Market-Kategorie nicht gefunden. Prüfe CATEGORY_ID.")
-    return cat
-
-
-async def next_sale_number_in_category(guild: discord.Guild, category_id: int) -> int:
-    n = 1
-    existing = {c.name for c in guild.text_channels if c.category_id == category_id}
-    while f"sale-{n}" in existing:
-        n += 1
-    return n
-
-
-async def get_market_listings_channel(guild: discord.Guild, channel_id: int | None) -> discord.TextChannel | None:
-    return await get_text_channel(guild, channel_id)
 
 
 # -------------------- Mute System --------------------
@@ -461,23 +442,13 @@ class RolePanelView(discord.ui.View):
             if role in member.roles:
                 await member.remove_roles(role, reason="Role Panel toggle")
                 await interaction.response.send_message(f"❌ Rolle entfernt: {role.mention}", ephemeral=True)
-                await send_log(
-                    interaction.guild,
-                    title="➖ Rolle entfernt (Panel)",
-                    color=discord.Color.red(),
-                    user=member,
-                    fields=[("Rolle", role.mention, True)],
-                )
+                await send_log(interaction.guild, title="➖ Rolle entfernt (Panel)", color=discord.Color.red(),
+                               user=member, fields=[("Rolle", role.mention, True)])
             else:
                 await member.add_roles(role, reason="Role Panel toggle")
                 await interaction.response.send_message(f"✅ Rolle bekommen: {role.mention}", ephemeral=True)
-                await send_log(
-                    interaction.guild,
-                    title="➕ Rolle hinzugefügt (Panel)",
-                    color=discord.Color.green(),
-                    user=member,
-                    fields=[("Rolle", role.mention, True)],
-                )
+                await send_log(interaction.guild, title="➕ Rolle hinzugefügt (Panel)", color=discord.Color.green(),
+                               user=member, fields=[("Rolle", role.mention, True)])
         except discord.Forbidden:
             await interaction.response.send_message("❌ Ich habe keine Rechte Rollen zu vergeben.", ephemeral=True)
 
@@ -500,6 +471,7 @@ class TicketManageView(discord.ui.View):
         async for msg in channel.history(limit=25):
             if msg.author == channel.guild.me and msg.embeds:
                 emb = msg.embeds[0]
+                # status in field 2
                 if len(emb.fields) >= 2:
                     emb.set_field_at(1, name="Status", value=status_text, inline=False)
                 else:
@@ -524,7 +496,7 @@ class TicketManageView(discord.ui.View):
 
         await interaction.response.send_message("🔒 Ticket wird in **5 Sekunden** geschlossen…", ephemeral=True)
 
-        transcript = await build_ticket_transcript(ch, limit=TRANSCRIPT_LIMIT)
+        transcript = await build_text_channel_transcript(ch, limit=TRANSCRIPT_LIMIT)
         f = discord.File(fp=io.BytesIO(transcript.encode("utf-8")), filename=f"{ch.name}-transcript.txt")
 
         await send_log(
@@ -532,10 +504,8 @@ class TicketManageView(discord.ui.View):
             title="🔒 Ticket geschlossen",
             color=discord.Color.red(),
             user=interaction.user,
-            fields=[
-                ("Channel", f"#{ch.name} (`{ch.id}`)", False),
-                ("Closed by", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
-            ],
+            fields=[("Channel", f"#{ch.name} (`{ch.id}`)", False),
+                    ("Closed by", f"{interaction.user.mention} (`{interaction.user.id}`)", False)],
             file=f,
         )
 
@@ -583,10 +553,8 @@ class TicketManageView(discord.ui.View):
             title="🧾 Ticket geclaimt",
             color=discord.Color.gold(),
             user=interaction.user,
-            fields=[
-                ("Channel", f"{ch.mention} (`{ch.id}`)", False),
-                ("Claimed by", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
-            ],
+            fields=[("Channel", f"{ch.mention} (`{ch.id}`)", False),
+                    ("Claimed by", f"{interaction.user.mention} (`{interaction.user.id}`)", False)],
         )
 
 
@@ -606,6 +574,7 @@ class TicketOpenView(discord.ui.View):
         except Exception as e:
             return await interaction.response.send_message(f"❌ {e}", ephemeral=True)
 
+        # already has ticket
         for ch in guild.text_channels:
             if ch.topic and f"user_id={member.id}" in ch.topic and ch.category_id == category.id:
                 return await interaction.response.send_message(f"Du hast bereits ein Ticket: {ch.mention}", ephemeral=True)
@@ -644,12 +613,7 @@ class TicketOpenView(discord.ui.View):
 
         staff_ping = " ".join(r.mention for r in staff_roles)
 
-        await ch.send(
-            content=staff_ping,
-            embed=embed,
-            view=TicketManageView(ticket_owner_id=member.id)
-        )
-
+        await ch.send(content=staff_ping, embed=embed, view=TicketManageView(ticket_owner_id=member.id))
         await interaction.response.send_message(f"✅ Ticket erstellt: {ch.mention}", ephemeral=True)
 
         await send_log(
@@ -657,11 +621,7 @@ class TicketOpenView(discord.ui.View):
             title="🎫 Ticket erstellt",
             color=discord.Color.green(),
             user=member,
-            fields=[
-                ("Channel", f"{ch.mention} (`{ch.id}`)", False),
-                ("Typ", kind, True),
-                ("Owner", f"{member.mention} (`{member.id}`)", True),
-            ],
+            fields=[("Channel", f"{ch.mention} (`{ch.id}`)", False), ("Typ", kind, True)],
         )
 
     @discord.ui.button(label="Question", style=discord.ButtonStyle.secondary, emoji="❓", custom_id="ticket_open:question")
@@ -677,15 +637,19 @@ class TicketOpenView(discord.ui.View):
         await self._create_ticket(interaction, "Partnership", "🤝")
 
 
-# -------------------- MARKET Views (Berlin/Polen) --------------------
+# -------------------- MARKET (Threads, keine extra Channels) --------------------
+def _sale_code() -> str:
+    return datetime.datetime.utcnow().strftime("%y%m%d-%H%M%S")
+
+
 class MarketListingContactView(discord.ui.View):
     """
-    Hinweis: Diese Listing-Buttons funktionieren solange der Bot läuft.
-    Nach Bot-Restart funktionieren alte Listing-Buttons nicht mehr (Discord limitation ohne DB).
+    Button lädt Käufer in den Thread ein.
+    Hinweis: Alte Listing-Buttons können nach Bot-Restart evtl. nicht mehr reagieren (Discord-UI Limitation).
     """
-    def __init__(self, sale_channel_id: int, seller_id: int, region_key: str):
+    def __init__(self, thread_id: int, seller_id: int, region_key: str):
         super().__init__(timeout=None)
-        self.sale_channel_id = sale_channel_id
+        self.thread_id = thread_id
         self.seller_id = seller_id
         self.region_key = region_key
 
@@ -695,173 +659,143 @@ class MarketListingContactView(discord.ui.View):
             return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
 
         buyer = interaction.user
-        guild = interaction.guild
-
         if buyer.id == self.seller_id:
             return await interaction.response.send_message("❌ Du bist der Seller.", ephemeral=True)
 
-        ch = guild.get_channel(self.sale_channel_id)
-        if not isinstance(ch, discord.TextChannel):
-            return await interaction.response.send_message("❌ Sale-Channel nicht gefunden (evtl. geschlossen).", ephemeral=True)
-
-        if ch.permissions_for(buyer).view_channel:
-            return await interaction.response.send_message(f"✅ Du hast bereits Zugriff: {ch.mention}", ephemeral=True)
+        thread = interaction.guild.get_thread(self.thread_id)
+        if not isinstance(thread, discord.Thread):
+            return await interaction.response.send_message("❌ Thread nicht gefunden (evtl. geschlossen).", ephemeral=True)
 
         try:
-            await ch.set_permissions(buyer, view_channel=True, send_messages=True, read_message_history=True,
-                                     reason="Buyer contacted sale listing")
+            await thread.add_user(buyer)
         except discord.Forbidden:
-            return await interaction.response.send_message("❌ Ich kann keine Permissions setzen.", ephemeral=True)
+            return await interaction.response.send_message("❌ Ich kann dich nicht in den Thread einladen.", ephemeral=True)
+        except discord.HTTPException:
+            # falls public thread: add_user kann trotzdem failen, dann einfach join-hinweis
+            pass
 
-        await ch.send(f"📩 {buyer.mention} möchte den Direktverkauf kontaktieren. (Buyer Zugriff hinzugefügt)")
-        await interaction.response.send_message(f"✅ Zugriff gegeben! Schreib hier: {ch.mention}", ephemeral=True)
+        try:
+            await thread.send(f"📩 {buyer.mention} möchte den Verkauf kontaktieren.")
+        except Exception:
+            pass
+
+        await interaction.response.send_message(f"✅ Du bist jetzt im Thread: {thread.mention}", ephemeral=True)
 
         await send_log(
-            guild,
-            title="📩 Buyer hat Verkauf kontaktiert",
+            interaction.guild,
+            title="📩 Buyer kontaktiert Verkauf (Thread)",
             color=discord.Color.blurple(),
             user=buyer,
-            fields=[
-                ("Region", MARKET_CFG[self.region_key]["label"], True),
-                ("Sale-Channel", f"{ch.mention} (`{ch.id}`)", False),
-                ("Buyer", f"{buyer.mention} (`{buyer.id}`)", False),
-                ("Seller ID", str(self.seller_id), True),
-            ],
+            fields=[("Region", MARKET_CFG[self.region_key]["label"], True),
+                    ("Thread", f"{thread.mention} (`{thread.id}`)", False),
+                    ("Seller ID", str(self.seller_id), True)],
         )
 
 
-class MarketManageView(discord.ui.View):
-    def __init__(self, owner_id: int, region_key: str):
+class MarketThreadManageView(discord.ui.View):
+    def __init__(self, owner_id: int, region_key: str, listing_channel_id: int, listing_message_id: int):
         super().__init__(timeout=None)
         self.owner_id = owner_id
         self.region_key = region_key
+        self.listing_channel_id = listing_channel_id
+        self.listing_message_id = listing_message_id
 
-    async def _update_status_embed(self, channel: discord.TextChannel, status_text: str):
-        async for msg in channel.history(limit=25):
-            if msg.author == channel.guild.me and msg.embeds:
-                emb = msg.embeds[0]
-                if len(emb.fields) >= 2:
-                    emb.set_field_at(1, name="Status", value=status_text, inline=False)
-                else:
-                    emb.add_field(name="Status", value=status_text, inline=False)
-                try:
-                    await msg.edit(embed=emb, view=self)
-                except Exception:
-                    pass
+    async def _edit_listing_status(self, guild: discord.Guild, status: str):
+        ch = guild.get_channel(self.listing_channel_id)
+        if not isinstance(ch, discord.TextChannel):
+            return
+        try:
+            msg = await ch.fetch_message(self.listing_message_id)
+        except Exception:
+            return
+        if not msg.embeds:
+            return
+
+        emb = msg.embeds[0]
+        found = False
+        for i, f in enumerate(emb.fields):
+            if f.name.lower() == "status":
+                emb.set_field_at(i, name="Status", value=status, inline=False)
+                found = True
                 break
+        if not found:
+            emb.add_field(name="Status", value=status, inline=False)
 
-    @discord.ui.button(label="Claim Sale", style=discord.ButtonStyle.success, emoji="🧾", custom_id="market:claim")
-    async def claim_sale(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await msg.edit(embed=emb)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="Claim", style=discord.ButtonStyle.success, emoji="🧾", custom_id="market_thread:claim")
+    async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+        if not isinstance(interaction.channel, discord.Thread):
+            return await interaction.response.send_message("❌ Nur im Thread nutzbar.", ephemeral=True)
 
         staff_ids = MARKET_CFG[self.region_key]["staff_role_ids"]
         if not is_market_staff(interaction.user, staff_ids):
             return await interaction.response.send_message("❌ Nur Sales/Staff kann claimen.", ephemeral=True)
 
-        ch = interaction.channel
-        if not isinstance(ch, discord.TextChannel):
-            return await interaction.response.send_message("Ungültiger Channel.", ephemeral=True)
-
-        topic_data = parse_topic(ch.topic)
-        if topic_data.get("claimed_by") and topic_data.get("claimed_by") != "none":
-            return await interaction.response.send_message("✅ Dieser Verkauf ist bereits geclaimt.", ephemeral=True)
-
-        new_topic = (ch.topic or "")
-        if "claimed_by=" in new_topic:
-            parts = [p.strip() for p in new_topic.split("|")]
-            fixed = []
-            for p in parts:
-                if p.startswith("claimed_by="):
-                    fixed.append(f"claimed_by={interaction.user.id}")
-                else:
-                    fixed.append(p)
-            new_topic = " | ".join(fixed)
-        else:
-            new_topic = (new_topic + " | " if new_topic else "") + f"claimed_by={interaction.user.id}"
-
-        await ch.edit(topic=new_topic, reason="Sale geclaimt")
-        await self._update_status_embed(ch, f"🟢 Geclaimt von {interaction.user.mention}")
-        await interaction.response.send_message(f"🧾 Sale geclaimt von {interaction.user.mention}", ephemeral=False)
+        await interaction.response.send_message(f"🧾 Geclaimt von {interaction.user.mention}", ephemeral=False)
+        await self._edit_listing_status(interaction.guild, f"🟢 Geclaimt von {interaction.user.mention}")
 
         await send_log(
             interaction.guild,
-            title="💸 Direktverkauf geclaimt",
+            title="💸 Direktverkauf geclaimt (Thread)",
             color=discord.Color.gold(),
             user=interaction.user,
-            fields=[
-                ("Region", MARKET_CFG[self.region_key]["label"], True),
-                ("Channel", f"{ch.mention} (`{ch.id}`)", False),
-                ("Claimed by", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
-            ],
+            fields=[("Region", MARKET_CFG[self.region_key]["label"], True),
+                    ("Thread", f"{interaction.channel.mention} (`{interaction.channel.id}`)", False)],
         )
 
-    @discord.ui.button(label="Close Sale", style=discord.ButtonStyle.danger, emoji="🔒", custom_id="market:close")
-    async def close_sale(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, emoji="🔒", custom_id="market_thread:close")
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
-        ch = interaction.channel
-        if not isinstance(ch, discord.TextChannel):
-            return await interaction.response.send_message("Ungültiger Channel.", ephemeral=True)
+        if not isinstance(interaction.channel, discord.Thread):
+            return await interaction.response.send_message("❌ Nur im Thread nutzbar.", ephemeral=True)
 
         staff_ids = MARKET_CFG[self.region_key]["staff_role_ids"]
         is_owner = interaction.user.id == self.owner_id
         if not (is_owner or is_market_staff(interaction.user, staff_ids)):
-            return await interaction.response.send_message("❌ Du darfst diesen Verkauf nicht schließen.", ephemeral=True)
+            return await interaction.response.send_message("❌ Du darfst nicht schließen.", ephemeral=True)
 
-        await interaction.response.send_message("🔒 Verkauf wird in **5 Sekunden** geschlossen…", ephemeral=True)
+        await interaction.response.send_message("🔒 Verkauf wird geschlossen…", ephemeral=True)
 
-        transcript = await build_ticket_transcript(ch, limit=TRANSCRIPT_LIMIT)
-        f = discord.File(fp=io.BytesIO(transcript.encode("utf-8")), filename=f"{ch.name}-transcript.txt")
+        thread: discord.Thread = interaction.channel
+        transcript = await build_thread_transcript(thread, limit=TRANSCRIPT_LIMIT)
+        f = discord.File(fp=io.BytesIO(transcript.encode("utf-8")), filename=f"{thread.name}-transcript.txt")
 
         await send_log(
             interaction.guild,
-            title="💸 Direktverkauf geschlossen",
+            title="💸 Direktverkauf geschlossen (Thread)",
             color=discord.Color.red(),
             user=interaction.user,
-            fields=[
-                ("Region", MARKET_CFG[self.region_key]["label"], True),
-                ("Channel", f"#{ch.name} (`{ch.id}`)", False),
-                ("Closed by", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
-            ],
+            fields=[("Region", MARKET_CFG[self.region_key]["label"], True),
+                    ("Thread", f"{thread.mention} (`{thread.id}`)", False),
+                    ("Closed by", f"{interaction.user.mention} (`{interaction.user.id}`)", False)],
             file=f,
         )
 
-        await asyncio.sleep(5)
+        await self._edit_listing_status(interaction.guild, "🔴 Closed")
+
         try:
-            await ch.delete(reason=f"Sale geschlossen von {interaction.user}")
-        except discord.Forbidden:
+            await thread.edit(archived=True, locked=True, reason="Sale geschlossen")
+        except Exception:
             pass
 
 
 class MarketSaleModal(discord.ui.Modal):
     def __init__(self, opener: discord.Member, region_key: str):
-        super().__init__(title=f"Majestic RP - Direktverkauf ({MARKET_CFG[region_key]['label']})")
+        super().__init__(title=f"Direktverkauf ({MARKET_CFG[region_key]['label']})")
         self.opener = opener
         self.region_key = region_key
 
-        self.item = discord.ui.TextInput(
-            label="Was verkaufst du?",
-            placeholder="z.B. Sultan RS, Waffe, Kleidung...",
-            max_length=200
-        )
-        self.price = discord.ui.TextInput(
-            label="Preis",
-            placeholder="z.B. 250.000$ / 300k / VB",
-            max_length=80
-        )
-        self.location = discord.ui.TextInput(
-            label="Ort/Server Info",
-            placeholder="z.B. Los Santos / Sandy / Treffpunkt...",
-            required=False,
-            max_length=120
-        )
-        self.contact = discord.ui.TextInput(
-            label="Kontakt/Zeiten",
-            placeholder="z.B. Discord: Name#0001 | 18-22 Uhr",
-            required=False,
-            max_length=150
-        )
+        self.item = discord.ui.TextInput(label="Was verkaufst du?", max_length=200)
+        self.price = discord.ui.TextInput(label="Preis", max_length=80)
+        self.location = discord.ui.TextInput(label="Ort/Info", required=False, max_length=120)
+        self.contact = discord.ui.TextInput(label="Kontakt/Zeiten", required=False, max_length=150)
 
         self.add_item(self.item)
         self.add_item(self.price)
@@ -882,87 +816,75 @@ class MarketSaleModal(discord.ui.Modal):
                 ephemeral=True
             )
 
+        listings_ch = await get_text_channel(guild, cfg["listings_channel_id"])
+        if not isinstance(listings_ch, discord.TextChannel):
+            return await interaction.response.send_message("❌ Listings-Channel nicht gefunden (ID prüfen).", ephemeral=True)
+
+        sale_code = _sale_code()
+
+        emb = discord.Embed(
+            title=f"🛒 Direktverkauf ({cfg['label']})",
+            description=f"Seller: {member.mention}",
+            color=discord.Color.green()
+        )
+        emb.add_field(name="Item", value=str(self.item), inline=False)
+        emb.add_field(name="Preis", value=str(self.price), inline=True)
+        emb.add_field(name="Ort/Info", value=(str(self.location).strip() or "—"), inline=True)
+        emb.add_field(name="Kontakt/Zeiten", value=(str(self.contact).strip() or "—"), inline=False)
+        emb.add_field(name="Status", value="🟡 Open", inline=False)
+        emb.set_thumbnail(url=member.display_avatar.url)
+
+        listing_msg = await listings_ch.send(embed=emb)
+
+        # Thread erstellen (kein extra Channel in der Liste)
         try:
-            category = await ensure_market_category(guild, cfg["category_id"])
-        except Exception as e:
-            return await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+            thread = await listing_msg.create_thread(
+                name=f"sale-{sale_code}",
+                auto_archive_duration=1440,
+                type=discord.ChannelType.public_thread
+            )
+        except TypeError:
+            # ältere discord.py Version ohne "type"
+            thread = await listing_msg.create_thread(name=f"sale-{sale_code}", auto_archive_duration=1440)
+        except discord.Forbidden:
+            return await interaction.response.send_message(
+                "❌ Ich darf keine Threads erstellen. Prüfe: Create Public Threads + Send Messages + Manage Threads.",
+                ephemeral=True
+            )
 
-        # 1 Sale pro User pro Region
-        for ch in guild.text_channels:
-            if ch.category_id == category.id and ch.topic and f"sale_user_id={member.id}" in ch.topic and f"region={self.region_key}" in ch.topic:
-                return await interaction.response.send_message(f"Du hast bereits einen Verkauf: {ch.mention}", ephemeral=True)
+        # Button unter Listing (Buyer wird in Thread eingeladen)
+        await listing_msg.edit(view=MarketListingContactView(thread_id=thread.id, seller_id=member.id, region_key=self.region_key))
 
-        sale_no = await next_sale_number_in_category(guild, category.id)
-        channel_name = f"sale-{sale_no}"
-
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True),
-        }
-
+        # Thread Start: Staff ping (kein mass-add von Mitgliedern)
         staff_roles = [guild.get_role(rid) for rid in cfg["staff_role_ids"]]
         staff_roles = [r for r in staff_roles if r is not None]
-        for r in staff_roles:
-            overwrites[r] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-
-        topic = f"sale_user_id={member.id} | claimed_by=none | type=direct_sale | region={self.region_key}"
-        sale_ch = await guild.create_text_channel(
-            name=channel_name,
-            category=category,
-            overwrites=overwrites,
-            topic=topic,
-            reason=f"Direktverkauf erstellt von {member} ({cfg['label']})"
-        )
-
-        sale_embed = discord.Embed(
-            title=f"💸 Direktverkauf ({cfg['label']})",
-            description="Hier wird der Direktverkauf abgewickelt.",
-            color=discord.Color.dark_grey()
-        )
-        sale_embed.add_field(name="Seller", value=f"{member.mention} (`{member.id}`)", inline=False)
-        sale_embed.add_field(name="Item", value=str(self.item), inline=False)
-        sale_embed.add_field(name="Preis", value=str(self.price), inline=True)
-        sale_embed.add_field(name="Ort", value=(str(self.location).strip() or "—"), inline=True)
-        sale_embed.add_field(name="Kontakt/Zeiten", value=(str(self.contact).strip() or "—"), inline=False)
-        sale_embed.add_field(name="Status", value="🟡 Open (not claimed)", inline=False)
-        sale_embed.set_thumbnail(url=member.display_avatar.url)
-
         staff_ping = " ".join(r.mention for r in staff_roles) if staff_roles else ""
-        await sale_ch.send(
-            content=staff_ping or None,
-            embed=sale_embed,
-            view=MarketManageView(owner_id=member.id, region_key=self.region_key)
+        await thread.send(
+            content=(staff_ping or None),
+            embed=discord.Embed(
+                title="💬 Verkaufs-Thread",
+                description="Hier klärt ihr den Deal. Staff kann claimen & schließen.",
+                color=discord.Color.dark_grey()
+            ),
+            view=MarketThreadManageView(
+                owner_id=member.id,
+                region_key=self.region_key,
+                listing_channel_id=listings_ch.id,
+                listing_message_id=listing_msg.id
+            )
         )
 
-        # Öffentliches Listing posten (Feed Channel)
-        listings_ch = await get_market_listings_channel(guild, cfg["listings_channel_id"])
-        if listings_ch:
-            public_embed = discord.Embed(
-                title=f"🛒 Neuer Direktverkauf ({cfg['label']})",
-                description=f"Seller: {member.mention}",
-                color=discord.Color.green()
-            )
-            public_embed.add_field(name="Item", value=str(self.item), inline=False)
-            public_embed.add_field(name="Preis", value=str(self.price), inline=True)
-            public_embed.add_field(name="Ort", value=(str(self.location).strip() or "—"), inline=True)
-            public_embed.add_field(name="Kontakt/Zeiten", value=(str(self.contact).strip() or "—"), inline=False)
-            public_embed.add_field(name="Kontakt", value=f"Klicke unten oder gehe zu: {sale_ch.mention}", inline=False)
-            public_embed.set_thumbnail(url=member.display_avatar.url)
-
-            view = MarketListingContactView(sale_channel_id=sale_ch.id, seller_id=member.id, region_key=self.region_key)
-            await listings_ch.send(embed=public_embed, view=view)
-
-        await interaction.response.send_message(f"✅ Direktverkauf erstellt: {sale_ch.mention}", ephemeral=True)
+        await interaction.response.send_message(f"✅ Verkauf gepostet in {listings_ch.mention} (Thread erstellt).", ephemeral=True)
 
         await send_log(
             guild,
-            title="💸 Direktverkauf erstellt",
+            title="💸 Direktverkauf erstellt (Thread)",
             color=discord.Color.green(),
             user=member,
             fields=[
                 ("Region", cfg["label"], True),
-                ("Sale-Channel", f"{sale_ch.mention} (`{sale_ch.id}`)", False),
+                ("Listings-Channel", listings_ch.mention, True),
+                ("Thread", f"{thread.mention} (`{thread.id}`)", False),
                 ("Item", str(self.item), False),
                 ("Preis", str(self.price), True),
             ],
@@ -974,11 +896,11 @@ class MarketOpenViewBerlin(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="Direktverkauf starten (Berlin)", style=discord.ButtonStyle.success, emoji="💸", custom_id="market_open:berlin")
-    async def start_sale(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
         if not has_role(interaction.user, MARKET_CFG["berlin"]["allowed_role_id"]):
-            return await interaction.response.send_message("❌ Du brauchst die **Berlin/Germany** Rolle.", ephemeral=True)
+            return await interaction.response.send_message("❌ Du brauchst die Berlin/Germany Rolle.", ephemeral=True)
         await interaction.response.send_modal(MarketSaleModal(opener=interaction.user, region_key="berlin"))
 
 
@@ -987,11 +909,11 @@ class MarketOpenViewPoland(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="Direktverkauf starten (Polen)", style=discord.ButtonStyle.success, emoji="💸", custom_id="market_open:poland")
-    async def start_sale(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
         if not has_role(interaction.user, MARKET_CFG["poland"]["allowed_role_id"]):
-            return await interaction.response.send_message("❌ Du brauchst die **Polen** Rolle.", ephemeral=True)
+            return await interaction.response.send_message("❌ Du brauchst die Polen Rolle.", ephemeral=True)
         await interaction.response.send_modal(MarketSaleModal(opener=interaction.user, region_key="poland"))
 
 
@@ -1058,14 +980,6 @@ async def ticket_setup(interaction: discord.Interaction):
     await panel_ch.send(embed=embed, view=TicketOpenView())
     await interaction.response.send_message(f"✅ Ticket-Panel gepostet in {panel_ch.mention}", ephemeral=True)
 
-    await send_log(
-        interaction.guild,
-        title="🧩 Ticket Panel gepostet",
-        color=discord.Color.blurple(),
-        user=interaction.user,
-        fields=[("Channel", panel_ch.mention, True)],
-    )
-
 
 @bot.tree.command(name="role_setup", description="Postet das Rollen-Panel (Staff/Admin)")
 @staff_check()
@@ -1094,22 +1008,12 @@ async def role_setup(interaction: discord.Interaction):
     await ch.send(embed=embed, view=RolePanelView())
     await interaction.response.send_message(f"✅ Rollen-Panel gepostet in {ch.mention}", ephemeral=True)
 
-    await send_log(
-        interaction.guild,
-        title="🧩 Role Panel gepostet",
-        color=discord.Color.blurple(),
-        user=interaction.user,
-        fields=[("Channel", ch.mention, True)],
-    )
 
-
-# -------------------- MARKET Setup Commands --------------------
 @bot.tree.command(name="market_setup_berlin", description="Postet Direktverkauf Panel (Berlin) (Staff/Admin)")
 @staff_check()
 async def market_setup_berlin(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
-
     cfg = MARKET_CFG["berlin"]
     if not cfg["panel_channel_id"]:
         return await interaction.response.send_message("❌ MARKET_BERLIN_PANEL_CHANNEL_ID fehlt.", ephemeral=True)
@@ -1120,19 +1024,11 @@ async def market_setup_berlin(interaction: discord.Interaction):
 
     embed = discord.Embed(
         title="💸 Direktverkauf (Berlin)",
-        description="Klicke unten, fülle das Formular aus und dein Verkauf wird im Berlin-Markt gepostet.",
+        description="Klicke unten, fülle das Formular aus und dein Verkauf wird als Post + Thread im Markt gepostet.",
         color=discord.Color.green()
     )
     await panel_ch.send(embed=embed, view=MarketOpenViewBerlin())
     await interaction.response.send_message(f"✅ Berlin Direktverkauf-Panel gepostet in {panel_ch.mention}", ephemeral=True)
-
-    await send_log(
-        interaction.guild,
-        title="🧩 Direktverkauf Panel gepostet",
-        color=discord.Color.blurple(),
-        user=interaction.user,
-        fields=[("Region", "Berlin", True), ("Channel", panel_ch.mention, True)],
-    )
 
 
 @bot.tree.command(name="market_setup_poland", description="Postet Direktverkauf Panel (Polen) (Staff/Admin)")
@@ -1140,7 +1036,6 @@ async def market_setup_berlin(interaction: discord.Interaction):
 async def market_setup_poland(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
-
     cfg = MARKET_CFG["poland"]
     if not cfg["panel_channel_id"]:
         return await interaction.response.send_message("❌ MARKET_POLAND_PANEL_CHANNEL_ID fehlt.", ephemeral=True)
@@ -1151,19 +1046,11 @@ async def market_setup_poland(interaction: discord.Interaction):
 
     embed = discord.Embed(
         title="💸 Direktverkauf (Polen)",
-        description="Klicke unten, fülle das Formular aus und dein Verkauf wird im Polen-Markt gepostet.",
+        description="Klicke unten, fülle das Formular aus und dein Verkauf wird als Post + Thread im Markt gepostet.",
         color=discord.Color.green()
     )
     await panel_ch.send(embed=embed, view=MarketOpenViewPoland())
     await interaction.response.send_message(f"✅ Polen Direktverkauf-Panel gepostet in {panel_ch.mention}", ephemeral=True)
-
-    await send_log(
-        interaction.guild,
-        title="🧩 Direktverkauf Panel gepostet",
-        color=discord.Color.blurple(),
-        user=interaction.user,
-        fields=[("Region", "Polen", True), ("Channel", panel_ch.mention, True)],
-    )
 
 
 # -------------------- Commands: Ticket direct --------------------
@@ -1199,7 +1086,7 @@ async def ticket_close(interaction: discord.Interaction):
 
     await interaction.response.send_message("🔒 Ticket wird in **5 Sekunden** geschlossen…", ephemeral=True)
 
-    transcript = await build_ticket_transcript(ch, limit=TRANSCRIPT_LIMIT)
+    transcript = await build_text_channel_transcript(ch, limit=TRANSCRIPT_LIMIT)
     f = discord.File(fp=io.BytesIO(transcript.encode("utf-8")), filename=f"{ch.name}-transcript.txt")
 
     await send_log(
@@ -1207,10 +1094,8 @@ async def ticket_close(interaction: discord.Interaction):
         title="🔒 Ticket geschlossen",
         color=discord.Color.red(),
         user=interaction.user,
-        fields=[
-            ("Channel", f"#{ch.name} (`{ch.id}`)", False),
-            ("Closed by", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
-        ],
+        fields=[("Channel", f"#{ch.name} (`{ch.id}`)", False),
+                ("Closed by", f"{interaction.user.mention} (`{interaction.user.id}`)", False)],
         file=f,
     )
 
@@ -1244,10 +1129,7 @@ async def clear(interaction: discord.Interaction, anzahl: int):
         title="🧹 Messages gelöscht",
         color=discord.Color.blurple(),
         user=interaction.user,
-        fields=[
-            ("Channel", interaction.channel.mention, True),
-            ("Anzahl", str(len(deleted)), True),
-        ],
+        fields=[("Channel", interaction.channel.mention, True), ("Anzahl", str(len(deleted)), True)],
     )
 
 
@@ -1269,11 +1151,9 @@ async def kick(interaction: discord.Interaction, user: discord.Member, grund: st
             title="👢 Kick",
             color=discord.Color.orange(),
             user=user,
-            fields=[
-                ("User", f"{user.mention} (`{user.id}`)", False),
-                ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
-                ("Grund", grund, False),
-            ],
+            fields=[("User", f"{user.mention} (`{user.id}`)", False),
+                    ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
+                    ("Grund", grund, False)],
         )
     except discord.Forbidden:
         await interaction.response.send_message("❌ Bot hat keine Rechte zum Kicken.", ephemeral=True)
@@ -1297,11 +1177,9 @@ async def ban(interaction: discord.Interaction, user: discord.Member, grund: str
             title="⛔ Ban",
             color=discord.Color.red(),
             user=user,
-            fields=[
-                ("User", f"{user.mention} (`{user.id}`)", False),
-                ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
-                ("Grund", grund, False),
-            ],
+            fields=[("User", f"{user.mention} (`{user.id}`)", False),
+                    ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
+                    ("Grund", grund, False)],
         )
     except discord.Forbidden:
         await interaction.response.send_message("❌ Bot hat keine Rechte zum Bannen.", ephemeral=True)
@@ -1328,13 +1206,11 @@ async def timeout(interaction: discord.Interaction, user: discord.Member, minute
             title="⏳ Timeout",
             color=discord.Color.orange(),
             user=user,
-            fields=[
-                ("User", f"{user.mention} (`{user.id}`)", False),
-                ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
-                ("Dauer", f"{minuten} Minuten", True),
-                ("Bis", until.strftime("%d.%m.%Y %H:%M UTC"), True),
-                ("Grund", grund, False),
-            ],
+            fields=[("User", f"{user.mention} (`{user.id}`)", False),
+                    ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
+                    ("Dauer", f"{minuten} Minuten", True),
+                    ("Bis", until.strftime("%d.%m.%Y %H:%M UTC"), True),
+                    ("Grund", grund, False)],
         )
     except discord.Forbidden:
         await interaction.response.send_message("❌ Bot hat keine Rechte für Timeout.", ephemeral=True)
@@ -1355,14 +1231,6 @@ async def mute_setup(interaction: discord.Interaction):
         return await interaction.followup.send(f"❌ Fehler: {e}", ephemeral=True)
 
     await interaction.followup.send("✅ Mute-Setup abgeschlossen (Muted-Rolle & Overwrites).", ephemeral=True)
-
-    await send_log(
-        interaction.guild,
-        title="🔧 Mute Setup durchgeführt",
-        color=discord.Color.blurple(),
-        user=interaction.user,
-        fields=[("Muted Role", muted_role.mention, True)],
-    )
 
 
 @bot.tree.command(name="mute", description="Mutet einen User (nur Unmute-Channel + eigene Tickets schreibbar)")
@@ -1434,12 +1302,10 @@ async def mute(interaction: discord.Interaction, user: discord.Member, minuten: 
         title="🔇 User gemutet",
         color=discord.Color.orange(),
         user=user,
-        fields=[
-            ("User", f"{user.mention} (`{user.id}`)", False),
-            ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
-            ("Dauer", dauer_txt, True),
-            ("Grund", grund, False),
-        ],
+        fields=[("User", f"{user.mention} (`{user.id}`)", False),
+                ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
+                ("Dauer", dauer_txt, True),
+                ("Grund", grund, False)],
     )
 
 
@@ -1477,11 +1343,8 @@ async def unmute(interaction: discord.Interaction, user: discord.Member):
         title="🔊 User entmutet",
         color=discord.Color.green(),
         user=user,
-        fields=[
-            ("User", f"{user.mention} (`{user.id}`)", False),
-            ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
-            ("Grund", "Manuell", True),
-        ],
+        fields=[("User", f"{user.mention} (`{user.id}`)", False),
+                ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False)],
     )
 
 
@@ -1692,10 +1555,8 @@ async def auto_unmute_loop():
                     title="⏱️ Auto-Unmute",
                     color=discord.Color.green(),
                     user=member,
-                    fields=[
-                        ("User", f"{member.mention} (`{member.id}`)", False),
-                        ("Grund", "Timer abgelaufen", True),
-                    ],
+                    fields=[("User", f"{member.mention} (`{member.id}`)", False),
+                            ("Grund", "Timer abgelaufen", True)],
                 )
 
 
@@ -1780,7 +1641,6 @@ async def on_guild_join(guild: discord.Guild):
 
 @bot.event
 async def on_ready():
-    # Persistente Views (Buttons funktionieren nach Restart für diese Panels)
     bot.add_view(TicketOpenView())
     bot.add_view(RolePanelView())
     bot.add_view(MarketOpenViewBerlin())
