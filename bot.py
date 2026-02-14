@@ -103,7 +103,12 @@ DB_PATH = os.path.join(BASE_DIR, "bot.sqlite3")
 
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    # WAL + busy timeout: reduziert "database is locked"
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS mutes (
             guild_id INTEGER NOT NULL,
@@ -121,12 +126,21 @@ def db():
             PRIMARY KEY (guild_id, user_id)
         )
     """)
+    # NEU: Rollen-Backup für Mutes
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mute_role_backup (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            role_ids TEXT NOT NULL,
+            PRIMARY KEY (guild_id, user_id)
+        )
+    """)
     return conn
 
 
 # ==================== BOT ====================
 intents = discord.Intents.default()
-intents.members = True
+intents.members = True  # braucht "Server Members Intent" im Developer Portal
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 discord.utils.setup_logging()
@@ -333,6 +347,60 @@ async def build_text_channel_transcript(channel: discord.TextChannel, limit: int
     return "\n".join(lines)
 
 
+# ==================== Mute Role Backup Helpers ====================
+def _serialize_role_ids(role_ids: list[int]) -> str:
+    return ",".join(str(r) for r in role_ids)
+
+
+def _deserialize_role_ids(s: str) -> list[int]:
+    out: list[int] = []
+    for part in (s or "").split(","):
+        part = part.strip()
+        if part.isdigit():
+            out.append(int(part))
+    return out
+
+
+def save_mute_roles_backup(guild_id: int, user_id: int, role_ids: list[int]):
+    conn = db()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO mute_role_backup(guild_id, user_id, role_ids) VALUES (?, ?, ?)",
+            (guild_id, user_id, _serialize_role_ids(role_ids))
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def pop_mute_roles_backup(guild_id: int, user_id: int) -> list[int]:
+    conn = db()
+    try:
+        row = conn.execute(
+            "SELECT role_ids FROM mute_role_backup WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id)
+        ).fetchone()
+        conn.execute(
+            "DELETE FROM mute_role_backup WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id)
+        )
+        conn.commit()
+        if not row:
+            return []
+        return _deserialize_role_ids(row[0])
+    finally:
+        conn.close()
+
+
+def can_bot_manage_role(guild: discord.Guild, role: discord.Role) -> bool:
+    if role.is_default() or role.managed:
+        return False
+    me = guild.me
+    if not me:
+        return False
+    return me.top_role > role
+
+
 # ==================== Ticket Helpers ====================
 async def ensure_ticket_category(guild: discord.Guild) -> discord.CategoryChannel:
     if not TICKET_CATEGORY_ID:
@@ -437,8 +505,9 @@ class TicketManageView(discord.ui.View):
         self.ticket_owner_id = ticket_owner_id
 
     async def _update_status_embed(self, channel: discord.TextChannel, status_text: str):
+        me = channel.guild.me
         async for msg in channel.history(limit=25):
-            if msg.author == channel.guild.me and msg.embeds:
+            if me and msg.author.id == me.id and msg.embeds:
                 emb = msg.embeds[0]
                 if len(emb.fields) >= 2:
                     emb.set_field_at(1, name="Status", value=status_text, inline=False)
@@ -542,9 +611,9 @@ class TicketOpenView(discord.ui.View):
         except Exception as e:
             return await interaction.response.send_message(f"❌ {e}", ephemeral=True)
 
-        # already has ticket
-        for ch in guild.text_channels:
-            if ch.topic and f"user_id={member.id}" in ch.topic and ch.category_id == category.id:
+        # already has ticket (nur in der Ticket-Kategorie iterieren)
+        for ch in category.text_channels:
+            if ch.topic and f"user_id={member.id}" in ch.topic:
                 return await interaction.response.send_message(f"Du hast bereits ein Ticket: {ch.mention}", ephemeral=True)
 
         ticket_no = await next_ticket_number(guild)
@@ -711,7 +780,6 @@ class MarketListingView(discord.ui.View):
         if buyer.id == seller_id:
             return await interaction.response.send_message("❌ Verkäufer kann nicht claimen." if lang != "pl" else "❌ Sprzedawca nie może zająć.", ephemeral=True)
 
-        # Optional: nur passende Region-Rolle darf claimen (Berlin/Polen getrennt)
         required_role = MARKET_CFG[region]["allowed_role_id"]
         if required_role and not has_role(buyer, required_role):
             return await interaction.response.send_message(
@@ -795,7 +863,6 @@ class MarketListingView(discord.ui.View):
 
         new_emb.set_footer(text=market_meta(seller_id=seller_id, region_key=region, claimed_by=claimed_by))
 
-        # Buttons deaktivieren (keine Interaktion mehr)
         await msg.edit(embed=new_emb, view=MarketListingView(disabled=True))
 
         await interaction.response.send_message("✅ Anzeige geschlossen." if lang != "pl" else "✅ Ogłoszenie zamknięte.", ephemeral=True)
@@ -858,7 +925,6 @@ class MarketSaleModal(discord.ui.Modal):
         if not isinstance(listings_ch, discord.TextChannel):
             return await interaction.response.send_message("❌ Listings-Channel nicht gefunden (ID prüfen).", ephemeral=True)
 
-        # Anzeige Embed
         if lang == "pl":
             emb = discord.Embed(
                 title=f"🛒 Sprzedaż bezpośrednia ({cfg['label']})",
@@ -1066,6 +1132,7 @@ async def market_setup_poland(interaction: discord.Interaction):
 # ==================== Commands: Ticket direct ====================
 ticket_group = app_commands.Group(name="ticket", description="Ticket Commands")
 
+
 @ticket_group.command(name="create", description="Erstellt ein Support-Ticket")
 @app_commands.describe(typ="Typ: Question / Recruitment / Partnership")
 async def ticket_create(interaction: discord.Interaction, typ: str):
@@ -1079,6 +1146,7 @@ async def ticket_create(interaction: discord.Interaction, typ: str):
         await view._create_ticket(interaction, "Partnership", "🤝")
     else:
         await interaction.response.send_message("❌ Ungültiger Typ. Nutze: Question / Recruitment / Partnership", ephemeral=True)
+
 
 @ticket_group.command(name="close", description="Schließt dieses Ticket (löscht Channel)")
 async def ticket_close(interaction: discord.Interaction):
@@ -1115,8 +1183,8 @@ async def ticket_close(interaction: discord.Interaction):
     except discord.Forbidden:
         pass
 
-bot.tree.add_command(ticket_group)
 
+bot.tree.add_command(ticket_group)
 
 # ==================== Commands: Moderation ====================
 @bot.tree.command(name="clear", description="Löscht Nachrichten (max 100)")
@@ -1269,6 +1337,35 @@ async def mute(interaction: discord.Interaction, user: discord.Member, minuten: 
     if muted_role in user.roles:
         return await interaction.followup.send("✅ User ist bereits gemutet.", ephemeral=True)
 
+    # 1) Rollen sichern + entfernen (User soll nur noch Muted haben)
+    backup_role_ids: list[int] = []
+    roles_to_remove: list[discord.Role] = []
+    cannot_remove: list[discord.Role] = []
+
+    for r in user.roles:
+        if r.is_default():
+            continue
+        if r.id == muted_role.id:
+            continue
+
+        backup_role_ids.append(r.id)
+
+        if can_bot_manage_role(interaction.guild, r):
+            roles_to_remove.append(r)
+        else:
+            cannot_remove.append(r)
+
+    save_mute_roles_backup(interaction.guild.id, user.id, backup_role_ids)
+
+    removed_count = 0
+    try:
+        if roles_to_remove:
+            await user.remove_roles(*roles_to_remove, reason=f"Mute: Rollen entfernt | by {interaction.user} | {grund}")
+            removed_count = len(roles_to_remove)
+    except discord.Forbidden:
+        pass
+
+    # 2) Muted geben
     try:
         await user.add_roles(muted_role, reason=f"Muted von {interaction.user} | {grund}")
     except discord.Forbidden:
@@ -1307,15 +1404,27 @@ async def mute(interaction: discord.Interaction, user: discord.Member, minuten: 
 
     await interaction.followup.send(f"🔇 {user.mention} wurde gemutet. Dauer: {dauer_txt}", ephemeral=True)
 
+    # Fail-safe Log: welche Rollen konnten nicht entfernt werden?
+    cannot_txt = "—"
+    if cannot_remove:
+        cannot_txt = " ".join(r.mention for r in cannot_remove[:20])
+        if len(cannot_remove) > 20:
+            cannot_txt += f" …(+{len(cannot_remove)-20})"
+
     await send_log(
         interaction.guild,
         title="🔇 User gemutet",
         color=discord.Color.orange(),
         user=user,
-        fields=[("User", f"{user.mention} (`{user.id}`)", False),
-                ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
-                ("Dauer", dauer_txt, True),
-                ("Grund", grund, False)],
+        fields=[
+            ("User", f"{user.mention} (`{user.id}`)", False),
+            ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
+            ("Dauer", dauer_txt, True),
+            ("Grund", grund, False),
+            ("Rollen gesichert", str(len(backup_role_ids)), True),
+            ("Rollen entfernt", str(removed_count), True),
+            ("Nicht entfernbar", cannot_txt, False),
+        ],
     )
 
 
@@ -1329,10 +1438,39 @@ async def unmute(interaction: discord.Interaction, user: discord.Member):
     if not muted_role or muted_role not in user.roles:
         return await interaction.response.send_message("User ist nicht gemutet.", ephemeral=True)
 
+    # Muted entfernen
     try:
         await user.remove_roles(muted_role, reason=f"Unmuted von {interaction.user}")
     except discord.Forbidden:
         return await interaction.response.send_message("❌ Ich habe keine Rechte, Rollen zu entfernen.", ephemeral=True)
+
+    # Rollen wiederherstellen
+    role_ids = pop_mute_roles_backup(interaction.guild.id, user.id)
+    to_add: list[discord.Role] = []
+    skipped = 0
+
+    for rid in role_ids:
+        role = interaction.guild.get_role(rid)
+        if not role:
+            skipped += 1
+            continue
+        if role.managed or role.is_default():
+            skipped += 1
+            continue
+        if not can_bot_manage_role(interaction.guild, role):
+            skipped += 1
+            continue
+        to_add.append(role)
+
+    restored = 0
+    add_failed = False
+    if to_add:
+        try:
+            await user.add_roles(*to_add, reason=f"Restore roles after unmute | by {interaction.user}")
+            restored = len(to_add)
+        except discord.Forbidden:
+            add_failed = True
+            skipped += len(to_add)
 
     conn = db()
     try:
@@ -1346,15 +1484,23 @@ async def unmute(interaction: discord.Interaction, user: discord.Member):
     except Exception:
         pass
 
-    await interaction.response.send_message(f"✅ {user.mention} wurde entmutet.", ephemeral=True)
+    await interaction.response.send_message(
+        f"✅ {user.mention} wurde entmutet. Rollen restored: **{restored}**, skipped: **{skipped}**.",
+        ephemeral=True
+    )
 
     await send_log(
         interaction.guild,
         title="🔊 User entmutet",
         color=discord.Color.green(),
         user=user,
-        fields=[("User", f"{user.mention} (`{user.id}`)", False),
-                ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False)],
+        fields=[
+            ("User", f"{user.mention} (`{user.id}`)", False),
+            ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
+            ("Rollen restored", str(restored), True),
+            ("Rollen skipped", str(skipped), True),
+            ("Add Roles failed", "Ja" if add_failed else "Nein", True),
+        ],
     )
 
 
@@ -1520,6 +1666,57 @@ async def eightball(interaction: discord.Interaction, frage: str):
     await interaction.response.send_message(f"🎱 Frage: **{frage}**\nAntwort: **{random.choice(answers)}**")
 
 
+# ==================== Muted Message Enforcement ====================
+# Strikter als Permissions: wenn gemutet, dann darf user nur im UNMUTE channel
+# und in seinem eigenen Ticket schreiben (Topic user_id=...).
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    if not message.guild or not isinstance(message.author, discord.Member):
+        return await bot.process_commands(message)
+
+    member = message.author
+    muted_role = discord.utils.get(message.guild.roles, name=MUTED_ROLE_NAME)
+    if muted_role and muted_role in member.roles:
+        # Allow: UNMUTE channel
+        if UNMUTE_CHANNEL_ID and isinstance(message.channel, discord.TextChannel) and message.channel.id == UNMUTE_CHANNEL_ID:
+            return await bot.process_commands(message)
+
+        # Allow: own ticket channel (topic user_id=member.id AND in ticket category)
+        allowed = False
+        if isinstance(message.channel, discord.TextChannel):
+            try:
+                topic_data = parse_topic(message.channel.topic)
+                owner_id = int(topic_data.get("user_id", "0") or 0)
+                if owner_id == member.id and (TICKET_CATEGORY_ID is None or message.channel.category_id == TICKET_CATEGORY_ID):
+                    allowed = True
+            except Exception:
+                allowed = False
+
+        if not allowed:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
+            # kurzer Hinweis (auto-delete)
+            try:
+                warn = await message.channel.send(
+                    f"🔇 {member.mention} du bist gemutet. Du darfst nur im <#{UNMUTE_CHANNEL_ID}> "
+                    f"und in **deinen** Ticket-Channels schreiben."
+                )
+                await asyncio.sleep(6)
+                await warn.delete()
+            except Exception:
+                pass
+
+            return  # block processing
+
+    await bot.process_commands(message)
+
+
 # ==================== Auto Unmute Loop ====================
 @tasks.loop(seconds=30)
 async def auto_unmute_loop():
@@ -1545,13 +1742,40 @@ async def auto_unmute_loop():
             muted_role = discord.utils.get(guild.roles, name=MUTED_ROLE_NAME)
 
             did_unmute = False
+            restored = 0
+            skipped = 0
+
             if member and muted_role and muted_role in member.roles:
                 try:
                     await member.remove_roles(muted_role, reason="Auto-Unmute (Timer)")
                     did_unmute = True
                 except Exception:
-                    pass
+                    did_unmute = False
 
+                if did_unmute:
+                    role_ids = pop_mute_roles_backup(guild_id, user_id)
+                    to_add: list[discord.Role] = []
+                    for rid in role_ids:
+                        role = guild.get_role(rid)
+                        if not role:
+                            skipped += 1
+                            continue
+                        if role.managed or role.is_default():
+                            skipped += 1
+                            continue
+                        if not can_bot_manage_role(guild, role):
+                            skipped += 1
+                            continue
+                        to_add.append(role)
+
+                    if to_add:
+                        try:
+                            await member.add_roles(*to_add, reason="Restore roles after auto-unmute")
+                            restored = len(to_add)
+                        except Exception:
+                            skipped += len(to_add)
+
+            # mutes entry cleanup
             conn2 = db()
             try:
                 conn2.execute("DELETE FROM mutes WHERE guild_id=? AND user_id=?", (guild_id, user_id))
@@ -1565,8 +1789,12 @@ async def auto_unmute_loop():
                     title="⏱️ Auto-Unmute",
                     color=discord.Color.green(),
                     user=member,
-                    fields=[("User", f"{member.mention} (`{member.id}`)", False),
-                            ("Grund", "Timer abgelaufen", True)],
+                    fields=[
+                        ("User", f"{member.mention} (`{member.id}`)", False),
+                        ("Grund", "Timer abgelaufen", True),
+                        ("Rollen restored", str(restored), True),
+                        ("Rollen skipped", str(skipped), True),
+                    ],
                 )
 
 
@@ -1651,12 +1879,11 @@ async def on_guild_join(guild: discord.Guild):
 
 @bot.event
 async def on_ready():
-    # Persistente Views (Buttons funktionieren nach Restart)
     bot.add_view(TicketOpenView())
     bot.add_view(RolePanelView())
     bot.add_view(MarketOpenViewBerlin())
     bot.add_view(MarketOpenViewPoland())
-    bot.add_view(MarketListingView(disabled=False))  # für alte + neue Listings
+    bot.add_view(MarketListingView(disabled=False))
 
     if not auto_unmute_loop.is_running():
         auto_unmute_loop.start()
