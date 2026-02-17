@@ -3,7 +3,6 @@ import io
 import asyncio
 import sqlite3
 import datetime
-import random
 from collections import defaultdict
 
 import discord
@@ -60,10 +59,9 @@ def env_bool(key: str, default: bool = True) -> bool:
 WELCOME_CHANNEL_ID = env_int("WELCOME_CHANNEL_ID")
 LOG_CHANNEL_ID = env_int("LOG_CHANNEL_ID")
 
-# Optional: separate log channels by category
+# Optional: separate log channels by category (falls nicht gesetzt -> LOG_CHANNEL_ID)
 LOG_CHANNEL_MOD_ID = env_int("LOG_CHANNEL_MOD_ID")
 LOG_CHANNEL_TICKET_ID = env_int("LOG_CHANNEL_TICKET_ID")
-LOG_CHANNEL_ECONOMY_ID = env_int("LOG_CHANNEL_ECONOMY_ID")
 LOG_CHANNEL_JOINLEAVE_ID = env_int("LOG_CHANNEL_JOINLEAVE_ID")
 LOG_CHANNEL_HISTORY_ID = env_int("LOG_CHANNEL_HISTORY_ID")
 LOG_CHANNEL_ERROR_ID = env_int("LOG_CHANNEL_ERROR_ID")
@@ -76,7 +74,6 @@ LOG_PING_ERROR_ROLE_IDS = env_int_list("LOG_PING_ERROR_ROLE_IDS")
 # Optional: toggles
 LOG_ENABLE_MOD = env_bool("LOG_ENABLE_MOD", True)
 LOG_ENABLE_TICKET = env_bool("LOG_ENABLE_TICKET", True)
-LOG_ENABLE_ECONOMY = env_bool("LOG_ENABLE_ECONOMY", True)
 LOG_ENABLE_JOINLEAVE = env_bool("LOG_ENABLE_JOINLEAVE", True)
 LOG_ENABLE_HISTORY = env_bool("LOG_ENABLE_HISTORY", True)
 LOG_ENABLE_ERROR = env_bool("LOG_ENABLE_ERROR", True)
@@ -97,14 +94,14 @@ ROLE_GERMANY_ID = env_int("ROLE_GERMANY_ID")
 TRANSCRIPT_LIMIT = env_int("TICKET_TRANSCRIPT_LIMIT") or 200
 
 if not TOKEN:
-    raise SystemExit("❌ DISCORD_BOT_TOKEN fehlt als Environment Variable (Railway Variables).")
+    raise SystemExit("❌ DISCORD_BOT_TOKEN fehlt als Environment Variable.")
+
 
 # ==================== DB ====================
 DB_PATH = os.path.join(BASE_DIR, "bot.sqlite3")
 
 
 def db():
-    # WAL + busy timeout: reduziert "database is locked"
     conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
@@ -118,15 +115,6 @@ def db():
             PRIMARY KEY (guild_id, user_id)
         )
     """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS economy (
-            guild_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            balance INTEGER NOT NULL DEFAULT 0,
-            last_daily TEXT,
-            PRIMARY KEY (guild_id, user_id)
-        )
-    """)
     # Rollen-Backup für Mutes
     conn.execute("""
         CREATE TABLE IF NOT EXISTS mute_role_backup (
@@ -136,7 +124,7 @@ def db():
             PRIMARY KEY (guild_id, user_id)
         )
     """)
-    # Mute-History
+    # History für Mutes
     conn.execute("""
         CREATE TABLE IF NOT EXISTS mute_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -181,6 +169,54 @@ def _fmt_dt_short(iso: str | None) -> str:
         return iso
 
 
+def parse_duration_to_minutes(text: str | None) -> int | None:
+    """
+    Unterstützt:
+      - "30m", "30min"
+      - "2h", "2hr"
+      - "1d", "1day"
+      - "perm", "permanent" => None (unbestimmt)
+      - reine Zahl wie "30" => Minuten
+    """
+    if text is None:
+        return None
+    s = str(text).strip().lower()
+    if not s:
+        return None
+
+    if s in ("perm", "perma", "permanent", "forever", "unlimited", "infinite"):
+        return None
+
+    s = s.replace(" ", "")
+
+    if s.isdigit():
+        n = int(s)
+        return n if n > 0 else None
+
+    for suf in ("mins", "min", "m"):
+        if s.endswith(suf):
+            num = s[:-len(suf)]
+            if num.isdigit():
+                n = int(num)
+                return n if n > 0 else None
+
+    for suf in ("hours", "hour", "hrs", "hr", "h"):
+        if s.endswith(suf):
+            num = s[:-len(suf)]
+            if num.isdigit():
+                n = int(num)
+                return n * 60 if n > 0 else None
+
+    for suf in ("days", "day", "d"):
+        if s.endswith(suf):
+            num = s[:-len(suf)]
+            if num.isdigit():
+                n = int(num)
+                return n * 1440 if n > 0 else None
+
+    raise ValueError("Ungültiges Format. Beispiele: 30m, 2h, 1d, perm")
+
+
 async def get_text_channel(guild: discord.Guild, channel_id: int | None) -> discord.TextChannel | None:
     if not channel_id:
         return None
@@ -210,9 +246,9 @@ def is_staff(member: discord.Member) -> bool:
 def staff_check():
     async def predicate(interaction: discord.Interaction) -> bool:
         return (
-            interaction.guild is not None and
-            isinstance(interaction.user, discord.Member) and
-            is_staff(interaction.user)
+            interaction.guild is not None
+            and isinstance(interaction.user, discord.Member)
+            and is_staff(interaction.user)
         )
     return app_commands.check(predicate)
 
@@ -333,8 +369,6 @@ def _log_enabled(cat: str) -> bool:
         return LOG_ENABLE_MOD
     if cat == "ticket":
         return LOG_ENABLE_TICKET
-    if cat == "economy":
-        return LOG_ENABLE_ECONOMY
     if cat == "joinleave":
         return LOG_ENABLE_JOINLEAVE
     if cat == "history":
@@ -350,8 +384,6 @@ def _log_channel_id_for_category(cat: str) -> int | None:
         return LOG_CHANNEL_MOD_ID or LOG_CHANNEL_ID
     if cat == "ticket":
         return LOG_CHANNEL_TICKET_ID or LOG_CHANNEL_ID
-    if cat == "economy":
-        return LOG_CHANNEL_ECONOMY_ID or LOG_CHANNEL_ID
     if cat == "joinleave":
         return LOG_CHANNEL_JOINLEAVE_ID or LOG_CHANNEL_ID
     if cat == "history":
@@ -397,7 +429,6 @@ async def send_log(
     if not log_ch:
         return
 
-    # Cooldown per guild+key/category to prevent spam (optional)
     if LOG_COOLDOWN_SECONDS and LOG_COOLDOWN_SECONDS > 0:
         key = cooldown_key or category
         now_ts = datetime.datetime.now().timestamp()
@@ -451,7 +482,7 @@ def save_mute_roles_backup(guild_id: int, user_id: int, role_ids: list[int]):
     try:
         conn.execute(
             "INSERT OR REPLACE INTO mute_role_backup(guild_id, user_id, role_ids) VALUES (?, ?, ?)",
-            (guild_id, user_id, _serialize_role_ids(role_ids))
+            (guild_id, user_id, _serialize_role_ids(role_ids)),
         )
         conn.commit()
     finally:
@@ -463,11 +494,11 @@ def pop_mute_roles_backup(guild_id: int, user_id: int) -> list[int]:
     try:
         row = conn.execute(
             "SELECT role_ids FROM mute_role_backup WHERE guild_id=? AND user_id=?",
-            (guild_id, user_id)
+            (guild_id, user_id),
         ).fetchone()
         conn.execute(
             "DELETE FROM mute_role_backup WHERE guild_id=? AND user_id=?",
-            (guild_id, user_id)
+            (guild_id, user_id),
         )
         conn.commit()
         if not row:
@@ -495,7 +526,7 @@ def history_add_mute(guild_id: int, user_id: int, moderator_id: int, reason: str
             INSERT INTO mute_history(guild_id, user_id, moderator_id, reason, muted_at, duration_minutes)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (guild_id, user_id, moderator_id, reason, now_utc().isoformat(), duration_minutes)
+            (guild_id, user_id, moderator_id, reason, now_utc().isoformat(), duration_minutes),
         )
         conn.commit()
     finally:
@@ -511,7 +542,7 @@ def history_mark_unmuted(guild_id: int, user_id: int, unmuted_by: int, method: s
             WHERE guild_id=? AND user_id=? AND unmuted_at IS NULL
             ORDER BY id DESC LIMIT 1
             """,
-            (guild_id, user_id)
+            (guild_id, user_id),
         ).fetchone()
         if not row:
             return
@@ -521,7 +552,7 @@ def history_mark_unmuted(guild_id: int, user_id: int, unmuted_by: int, method: s
             SET unmuted_at=?, unmuted_by=?, unmute_method=?
             WHERE id=?
             """,
-            (now_utc().isoformat(), unmuted_by, method, int(row[0]))
+            (now_utc().isoformat(), unmuted_by, method, int(row[0])),
         )
         conn.commit()
     finally:
@@ -539,11 +570,11 @@ def history_fetch(guild_id: int, user_id: int, limit: int = 10) -> tuple[int, li
             ORDER BY id DESC
             LIMIT ?
             """,
-            (guild_id, user_id, int(limit))
+            (guild_id, user_id, int(limit)),
         ).fetchall()
         total = conn.execute(
             "SELECT COUNT(*) FROM mute_history WHERE guild_id=? AND user_id=?",
-            (guild_id, user_id)
+            (guild_id, user_id),
         ).fetchone()[0]
         return int(total), rows
     finally:
@@ -555,7 +586,7 @@ def history_clear_user(guild_id: int, user_id: int) -> int:
     try:
         cur = conn.execute(
             "DELETE FROM mute_history WHERE guild_id=? AND user_id=?",
-            (guild_id, user_id)
+            (guild_id, user_id),
         )
         conn.commit()
         return int(cur.rowcount or 0)
@@ -575,7 +606,7 @@ def history_top(guild_id: int, limit: int = 10) -> list[tuple[int, int]]:
             ORDER BY c DESC
             LIMIT ?
             """,
-            (guild_id, int(limit))
+            (guild_id, int(limit)),
         ).fetchall()
         return [(int(r[0]), int(r[1])) for r in rows]
     finally:
@@ -660,25 +691,13 @@ class RolePanelView(discord.ui.View):
             if role in member.roles:
                 await member.remove_roles(role, reason="Role Panel toggle")
                 await interaction.response.send_message(f"❌ Rolle entfernt: {role.mention}", ephemeral=True)
-                await send_log(
-                    interaction.guild,
-                    category="mod",
-                    title="➖ Rolle entfernt (Panel)",
-                    color=discord.Color.red(),
-                    user=member,
-                    fields=[("Rolle", role.mention, True)]
-                )
+                await send_log(interaction.guild, category="mod", title="➖ Rolle entfernt (Panel)",
+                               color=discord.Color.red(), user=member, fields=[("Rolle", role.mention, True)])
             else:
                 await member.add_roles(role, reason="Role Panel toggle")
                 await interaction.response.send_message(f"✅ Rolle bekommen: {role.mention}", ephemeral=True)
-                await send_log(
-                    interaction.guild,
-                    category="mod",
-                    title="➕ Rolle hinzugefügt (Panel)",
-                    color=discord.Color.green(),
-                    user=member,
-                    fields=[("Rolle", role.mention, True)]
-                )
+                await send_log(interaction.guild, category="mod", title="➕ Rolle hinzugefügt (Panel)",
+                               color=discord.Color.green(), user=member, fields=[("Rolle", role.mention, True)])
         except discord.Forbidden:
             await interaction.response.send_message("❌ Ich habe keine Rechte Rollen zu vergeben.", ephemeral=True)
 
@@ -735,12 +754,9 @@ class TicketManageView(discord.ui.View):
             title="🔒 Ticket geschlossen",
             color=discord.Color.red(),
             user=interaction.user,
-            fields=[
-                ("Channel", f"#{ch.name} (`{ch.id}`)", False),
-                ("Closed by", f"{interaction.user.mention} (`{interaction.user.id}`)", False)
-            ],
+            fields=[("Channel", f"#{ch.name} (`{ch.id}`)", False),
+                    ("Closed by", f"{interaction.user.mention} (`{interaction.user.id}`)", False)],
             file=f,
-            ping_roles=False,
         )
 
         await asyncio.sleep(5)
@@ -788,10 +804,8 @@ class TicketManageView(discord.ui.View):
             title="🧾 Ticket geclaimt",
             color=discord.Color.gold(),
             user=interaction.user,
-            fields=[
-                ("Channel", f"{ch.mention} (`{ch.id}`)", False),
-                ("Claimed by", f"{interaction.user.mention} (`{interaction.user.id}`)", False)
-            ],
+            fields=[("Channel", f"{ch.mention} (`{ch.id}`)", False),
+                    ("Claimed by", f"{interaction.user.mention} (`{interaction.user.id}`)", False)],
         )
 
 
@@ -811,7 +825,6 @@ class TicketOpenView(discord.ui.View):
         except Exception as e:
             return await interaction.response.send_message(f"❌ {e}", ephemeral=True)
 
-        # already has ticket (nur in der Ticket-Kategorie iterieren)
         for ch in category.text_channels:
             if ch.topic and f"user_id={member.id}" in ch.topic:
                 return await interaction.response.send_message(f"Du hast bereits ein Ticket: {ch.mention}", ephemeral=True)
@@ -836,13 +849,13 @@ class TicketOpenView(discord.ui.View):
             category=category,
             overwrites=overwrites,
             topic=topic,
-            reason=f"Ticket erstellt von {member} ({kind})"
+            reason=f"Ticket erstellt von {member} ({kind})",
         )
 
         embed = discord.Embed(
             title="Tickets",
             description=f"{member.mention} created a new **{emoji} {kind}** ticket.",
-            color=discord.Color.dark_grey()
+            color=discord.Color.dark_grey(),
         )
         embed.add_field(name="User", value=f"{member} (`{member.id}`)", inline=False)
         embed.add_field(name="Status", value="🟡 Open (not claimed)", inline=False)
@@ -860,7 +873,7 @@ class TicketOpenView(discord.ui.View):
             color=discord.Color.green(),
             user=member,
             fields=[("Channel", f"{ch.mention} (`{ch.id}`)", False), ("Typ", kind, True)],
-            ping_roles=True,  # optional ping staff role ids for ticket category (if configured)
+            ping_roles=True,
             cooldown_key="ticket_created",
         )
 
@@ -877,52 +890,6 @@ class TicketOpenView(discord.ui.View):
         await self._create_ticket(interaction, "Partnership", "🤝")
 
 
-# ==================== Economy Helpers ====================
-def econ_get(guild_id: int, user_id: int) -> tuple[int, str | None]:
-    conn = db()
-    try:
-        row = conn.execute(
-            "SELECT balance, last_daily FROM economy WHERE guild_id=? AND user_id=?",
-            (guild_id, user_id)
-        ).fetchone()
-        if not row:
-            conn.execute(
-                "INSERT OR IGNORE INTO economy(guild_id, user_id, balance, last_daily) VALUES (?, ?, 0, NULL)",
-                (guild_id, user_id)
-            )
-            conn.commit()
-            return 0, None
-        return int(row[0]), row[1]
-    finally:
-        conn.close()
-
-
-def econ_set_balance(guild_id: int, user_id: int, new_balance: int):
-    conn = db()
-    try:
-        conn.execute(
-            "INSERT INTO economy(guild_id, user_id, balance, last_daily) VALUES (?, ?, ?, NULL) "
-            "ON CONFLICT(guild_id, user_id) DO UPDATE SET balance=excluded.balance",
-            (guild_id, user_id, int(new_balance))
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def econ_set_daily(guild_id: int, user_id: int, last_daily_iso: str):
-    conn = db()
-    try:
-        conn.execute(
-            "INSERT INTO economy(guild_id, user_id, balance, last_daily) VALUES (?, ?, 0, ?) "
-            "ON CONFLICT(guild_id, user_id) DO UPDATE SET last_daily=excluded.last_daily",
-            (guild_id, user_id, last_daily_iso)
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
 # ==================== Commands: Setup Panels ====================
 @bot.tree.command(name="ticket_setup", description="Postet das Ticket Panel (Staff/Admin)")
 @staff_check()
@@ -930,7 +897,7 @@ async def ticket_setup(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
     if not TICKET_PANEL_CHANNEL_ID:
-        return await interaction.response.send_message("❌ TICKET_PANEL_CHANNEL_ID fehlt in Env-Variablen", ephemeral=True)
+        return await interaction.response.send_message("❌ TICKET_PANEL_CHANNEL_ID fehlt", ephemeral=True)
 
     panel_ch = interaction.guild.get_channel(TICKET_PANEL_CHANNEL_ID)
     if not isinstance(panel_ch, discord.TextChannel):
@@ -947,7 +914,7 @@ async def role_setup(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
     if not ROLE_PANEL_CHANNEL_ID:
-        return await interaction.response.send_message("❌ ROLE_PANEL_CHANNEL_ID fehlt in Env-Variablen", ephemeral=True)
+        return await interaction.response.send_message("❌ ROLE_PANEL_CHANNEL_ID fehlt", ephemeral=True)
 
     ch = interaction.guild.get_channel(ROLE_PANEL_CHANNEL_ID)
     if not isinstance(ch, discord.TextChannel):
@@ -963,7 +930,7 @@ async def role_setup(interaction: discord.Interaction):
             "Drück auf den Button. Dann bekommst du deine Rolle.\n\n"
             "__________________________"
         ),
-        color=discord.Color.green()
+        color=discord.Color.green(),
     )
     await ch.send(embed=embed, view=RolePanelView())
     await interaction.response.send_message(f"✅ Rollen-Panel gepostet in {ch.mention}", ephemeral=True)
@@ -1107,38 +1074,6 @@ async def ban(interaction: discord.Interaction, user: discord.Member, grund: str
         await interaction.response.send_message("❌ Bot hat keine Rechte zum Bannen.", ephemeral=True)
 
 
-@bot.tree.command(name="timeout", description="Timeout für einen User (Minuten)")
-@app_commands.describe(user="User", minuten="Dauer in Minuten", grund="Grund (optional)")
-async def timeout(interaction: discord.Interaction, user: discord.Member, minuten: int, grund: str | None = None):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
-    if not interaction.user.guild_permissions.moderate_members and not is_staff(interaction.user):
-        return await interaction.response.send_message("❌ Keine Rechte (Moderate Members).", ephemeral=True)
-
-    minuten = max(1, min(10080, minuten))
-    until = now_utc() + datetime.timedelta(minutes=minuten)
-    grund = grund or "—"
-
-    try:
-        await user.timeout(until, reason=f"{grund} | by {interaction.user}")
-        await interaction.response.send_message(f"✅ Timeout gesetzt für {user.mention}: {minuten} Minuten.", ephemeral=True)
-
-        await send_log(
-            interaction.guild,
-            category="mod",
-            title="⏳ Timeout",
-            color=discord.Color.orange(),
-            user=user,
-            fields=[("User", f"{user.mention} (`{user.id}`)", False),
-                    ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
-                    ("Dauer", f"{minuten} Minuten", True),
-                    ("Bis", until.strftime("%d.%m.%Y %H:%M UTC"), True),
-                    ("Grund", grund, False)],
-        )
-    except discord.Forbidden:
-        await interaction.response.send_message("❌ Bot hat keine Rechte für Timeout.", ephemeral=True)
-
-
 # ==================== Commands: Mute ====================
 @bot.tree.command(name="mute_setup", description="Einmaliges Setup: Muted Rolle + Overwrites (Staff/Admin)")
 @staff_check()
@@ -1158,8 +1093,17 @@ async def mute_setup(interaction: discord.Interaction):
 
 @bot.tree.command(name="mute", description="Mutet einen User (nur Unmute-Channel + eigene Tickets schreibbar)")
 @staff_check()
-@app_commands.describe(user="User", minuten="Dauer in Minuten (optional)", grund="Grund (optional)")
-async def mute(interaction: discord.Interaction, user: discord.Member, minuten: int | None = None, grund: str | None = None):
+@app_commands.describe(
+    user="User",
+    dauer="Dauer z.B. 30m, 2h, 1d, perm (oder Zahl = Minuten)",
+    grund="Grund (optional)"
+)
+async def mute(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    dauer: str | None = None,
+    grund: str | None = None
+):
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
 
@@ -1173,6 +1117,11 @@ async def mute(interaction: discord.Interaction, user: discord.Member, minuten: 
 
     grund = grund or "Kein Grund angegeben"
 
+    try:
+        minutes = parse_duration_to_minutes(dauer)
+    except ValueError as e:
+        return await interaction.followup.send(f"❌ {e}", ephemeral=True)
+
     muted_role = await get_or_create_muted_role(interaction.guild)
     try:
         await apply_mute_overwrites(interaction.guild, muted_role)
@@ -1182,7 +1131,7 @@ async def mute(interaction: discord.Interaction, user: discord.Member, minuten: 
     if muted_role in user.roles:
         return await interaction.followup.send("✅ User ist bereits gemutet.", ephemeral=True)
 
-    # 1) Rollen sichern + entfernen (User soll nur noch Muted haben)
+    # Rollen sichern + entfernen
     backup_role_ids: list[int] = []
     roles_to_remove: list[discord.Role] = []
     cannot_remove: list[discord.Role] = []
@@ -1210,33 +1159,34 @@ async def mute(interaction: discord.Interaction, user: discord.Member, minuten: 
     except discord.Forbidden:
         pass
 
-    # 2) Muted geben
+    # Muted geben
     try:
         await user.add_roles(muted_role, reason=f"Muted von {interaction.user} | {grund}")
     except discord.Forbidden:
         return await interaction.followup.send("❌ Ich habe keine Rechte, Rollen zu vergeben.", ephemeral=True)
 
+    # Timer speichern
     unmute_at = None
-    if minuten is not None and minuten > 0:
-        unmute_at_dt = now_utc() + datetime.timedelta(minutes=minuten)
+    if minutes is not None and minutes > 0:
+        unmute_at_dt = now_utc() + datetime.timedelta(minutes=minutes)
         unmute_at = unmute_at_dt.isoformat()
 
     conn = db()
     try:
         conn.execute(
             "INSERT OR REPLACE INTO mutes(guild_id, user_id, unmute_at) VALUES (?, ?, ?)",
-            (interaction.guild.id, user.id, unmute_at)
+            (interaction.guild.id, user.id, unmute_at),
         )
         conn.commit()
     finally:
         conn.close()
 
-    # History entry
-    history_add_mute(interaction.guild.id, user.id, interaction.user.id, grund, minuten if (minuten and minuten > 0) else None)
+    # History
+    history_add_mute(interaction.guild.id, user.id, interaction.user.id, grund, minutes)
 
     unmute_ch = interaction.guild.get_channel(UNMUTE_CHANNEL_ID)
     unmute_hint = f"#{unmute_ch.name}" if isinstance(unmute_ch, discord.TextChannel) else "den Unmute-Channel"
-    dauer_txt = f"{minuten} Minuten" if (minuten and minuten > 0) else "unbestimmt"
+    dauer_txt = (f"{minutes} Minuten" if minutes is not None else "permanent")
 
     try:
         await user.send(
@@ -1277,7 +1227,6 @@ async def mute(interaction: discord.Interaction, user: discord.Member, minuten: 
         cooldown_key=f"mute:{user.id}",
     )
 
-    # Extra history log category
     await send_log(
         interaction.guild,
         category="history",
@@ -1295,21 +1244,28 @@ async def mute(interaction: discord.Interaction, user: discord.Member, minuten: 
     )
 
 
-@bot.tree.command(name="unmute", description="Entmutet einen User")
+@bot.tree.command(name="unmute", description="Entmutet einen User (Grund Pflicht)")
 @staff_check()
-async def unmute(interaction: discord.Interaction, user: discord.Member):
+@app_commands.describe(user="User", grund="Grund (Pflicht)")
+async def unmute(interaction: discord.Interaction, user: discord.Member, grund: str):
     if not interaction.guild:
         return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+
+    grund = (grund or "").strip()
+    if not grund:
+        return await interaction.response.send_message("❌ Grund ist Pflicht.", ephemeral=True)
 
     muted_role = discord.utils.get(interaction.guild.roles, name=MUTED_ROLE_NAME)
     if not muted_role or muted_role not in user.roles:
         return await interaction.response.send_message("User ist nicht gemutet.", ephemeral=True)
 
+    # Muted entfernen
     try:
-        await user.remove_roles(muted_role, reason=f"Unmuted von {interaction.user}")
+        await user.remove_roles(muted_role, reason=f"Unmuted von {interaction.user} | {grund}")
     except discord.Forbidden:
         return await interaction.response.send_message("❌ Ich habe keine Rechte, Rollen zu entfernen.", ephemeral=True)
 
+    # Rollen wiederherstellen
     role_ids = pop_mute_roles_backup(interaction.guild.id, user.id)
     to_add: list[discord.Role] = []
     skipped = 0
@@ -1331,12 +1287,13 @@ async def unmute(interaction: discord.Interaction, user: discord.Member):
     add_failed = False
     if to_add:
         try:
-            await user.add_roles(*to_add, reason=f"Restore roles after unmute | by {interaction.user}")
+            await user.add_roles(*to_add, reason=f"Restore roles after unmute | by {interaction.user} | {grund}")
             restored = len(to_add)
         except discord.Forbidden:
             add_failed = True
             skipped += len(to_add)
 
+    # mutes cleanup
     conn = db()
     try:
         conn.execute("DELETE FROM mutes WHERE guild_id=? AND user_id=?", (interaction.guild.id, user.id))
@@ -1344,16 +1301,17 @@ async def unmute(interaction: discord.Interaction, user: discord.Member):
     finally:
         conn.close()
 
+    # history: unmute mark
     history_mark_unmuted(interaction.guild.id, user.id, interaction.user.id, "manual")
 
     try:
-        await user.send(f"✅ Du wurdest auf **{interaction.guild.name}** entmutet.")
+        await user.send(f"✅ Du wurdest auf **{interaction.guild.name}** entmutet.\n📝 Grund: {grund}")
     except Exception:
         pass
 
     await interaction.response.send_message(
-        f"✅ {user.mention} wurde entmutet. Rollen restored: **{restored}**, skipped: **{skipped}**.",
-        ephemeral=True
+        f"✅ {user.mention} wurde entmutet.\n📝 Grund: **{grund}**\nRollen restored: **{restored}**, skipped: **{skipped}**.",
+        ephemeral=True,
     )
 
     await send_log(
@@ -1365,6 +1323,7 @@ async def unmute(interaction: discord.Interaction, user: discord.Member):
         fields=[
             ("User", f"{user.mention} (`{user.id}`)", False),
             ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
+            ("Grund", grund, False),
             ("Rollen restored", str(restored), True),
             ("Rollen skipped", str(skipped), True),
             ("Add Roles failed", "Ja" if add_failed else "Nein", True),
@@ -1381,6 +1340,7 @@ async def unmute(interaction: discord.Interaction, user: discord.Member):
         fields=[
             ("User", f"{user.mention} (`{user.id}`)", False),
             ("Unmuted by", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
+            ("Grund", grund, False),
             ("Method", "`manual`", True),
             ("Zeit", _fmt_dt_short(now_utc().isoformat()), False),
         ],
@@ -1408,14 +1368,14 @@ async def history_user(interaction: discord.Interaction, user: discord.Member, l
     emb = discord.Embed(
         title="📜 Mute History",
         description=f"User: {user.mention} (`{user.id}`)\nTotal Mutes: **{total}**\nZeige letzte **{len(rows)}** Einträge:",
-        color=discord.Color.orange()
+        color=discord.Color.orange(),
     )
     emb.set_thumbnail(url=user.display_avatar.url)
 
     for idx, (moderator_id, reason, muted_at, duration_minutes, unmuted_at, unmuted_by, unmute_method) in enumerate(rows, start=1):
         mod_txt = f"<@{int(moderator_id)}>" if moderator_id else "—"
         reason_txt = (reason or "—")
-        dur_txt = f"{duration_minutes} min" if duration_minutes else "unbestimmt"
+        dur_txt = f"{duration_minutes} min" if duration_minutes else "permanent"
         muted_txt = _fmt_dt_short(muted_at)
 
         if unmuted_at:
@@ -1434,7 +1394,7 @@ async def history_user(interaction: discord.Interaction, user: discord.Member, l
                 f"Grund: {reason_txt}\n"
                 f"{status}"
             ),
-            inline=False
+            inline=False,
         )
 
     await interaction.response.send_message(embed=emb, ephemeral=True)
@@ -1450,7 +1410,7 @@ async def history_clear(interaction: discord.Interaction, user: discord.Member):
     deleted = history_clear_user(interaction.guild.id, user.id)
     await interaction.response.send_message(
         f"🧹 Mute-History für {user.mention} gelöscht: **{deleted}** Eintrag/Einträge.",
-        ephemeral=True
+        ephemeral=True,
     )
 
     await send_log(
@@ -1459,10 +1419,7 @@ async def history_clear(interaction: discord.Interaction, user: discord.Member):
         title="🧹 Mute-History gelöscht",
         color=discord.Color.red(),
         user=interaction.user,
-        fields=[
-            ("User", f"{user.mention} (`{user.id}`)", False),
-            ("Gelöscht", str(deleted), True),
-        ],
+        fields=[("User", f"{user.mention} (`{user.id}`)", False), ("Gelöscht", str(deleted), True)],
         cooldown_key=f"history_clear:{user.id}",
     )
 
@@ -1483,7 +1440,7 @@ async def history_top_cmd(interaction: discord.Interaction, limit: int | None = 
     emb = discord.Embed(
         title="📊 Mute Top List",
         description=f"Top **{len(top)}** (nach Anzahl Mutes)",
-        color=discord.Color.orange()
+        color=discord.Color.orange(),
     )
 
     lines = []
@@ -1498,108 +1455,10 @@ async def history_top_cmd(interaction: discord.Interaction, limit: int | None = 
 
 bot.tree.add_command(history_group)
 
-# ==================== Economy Commands ====================
-@bot.tree.command(name="balance", description="Zeigt den Kontostand")
-@app_commands.describe(user="User (optional)")
-async def balance(interaction: discord.Interaction, user: discord.Member | None = None):
-    if not interaction.guild:
-        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
-    user = user or interaction.user
-    bal, _ = econ_get(interaction.guild.id, user.id)
-    await interaction.response.send_message(f"💰 {user.mention} hat **{bal}** Coins.", ephemeral=True)
-
-
-@bot.tree.command(name="daily", description="Tägliche Coins abholen (alle 24h)")
-async def daily(interaction: discord.Interaction):
-    if not interaction.guild:
-        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
-
-    guild_id = interaction.guild.id
-    user_id = interaction.user.id
-    bal, last = econ_get(guild_id, user_id)
-
-    now = now_utc()
-    if last:
-        try:
-            last_dt = datetime.datetime.fromisoformat(last)
-            if now - last_dt < datetime.timedelta(hours=24):
-                remaining = datetime.timedelta(hours=24) - (now - last_dt)
-                hours = int(remaining.total_seconds() // 3600)
-                mins = int((remaining.total_seconds() % 3600) // 60)
-                return await interaction.response.send_message(
-                    f"⏳ Daily schon benutzt. Warte noch **{hours}h {mins}m**.",
-                    ephemeral=True
-                )
-        except Exception:
-            pass
-
-    reward = random.randint(50, 150)
-    econ_set_balance(guild_id, user_id, bal + reward)
-    econ_set_daily(guild_id, user_id, now.isoformat())
-    await interaction.response.send_message(f"✅ Daily erhalten: **+{reward}** Coins. (Neu: {bal + reward})", ephemeral=True)
-
-    await send_log(
-        interaction.guild,
-        category="economy",
-        title="💸 Daily benutzt",
-        color=discord.Color.green(),
-        user=interaction.user,
-        fields=[
-            ("User", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
-            ("Reward", f"+{reward}", True),
-            ("Neuer Stand", str(bal + reward), True),
-        ],
-        cooldown_key=f"daily:{interaction.user.id}",
-    )
-
-
-@bot.tree.command(name="pay", description="Zahle Coins an einen User")
-@app_commands.describe(user="Empfänger", amount="Betrag")
-async def pay(interaction: discord.Interaction, user: discord.Member, amount: int):
-    if not interaction.guild:
-        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
-    if user.id == interaction.user.id:
-        return await interaction.response.send_message("❌ Du kannst dir nicht selbst Coins zahlen.", ephemeral=True)
-    if amount <= 0:
-        return await interaction.response.send_message("❌ Betrag muss > 0 sein.", ephemeral=True)
-
-    guild_id = interaction.guild.id
-    sender_id = interaction.user.id
-    recv_id = user.id
-
-    sender_bal, _ = econ_get(guild_id, sender_id)
-    recv_bal, _ = econ_get(guild_id, recv_id)
-
-    if sender_bal < amount:
-        return await interaction.response.send_message("❌ Nicht genug Coins.", ephemeral=True)
-
-    econ_set_balance(guild_id, sender_id, sender_bal - amount)
-    econ_set_balance(guild_id, recv_id, recv_bal + amount)
-
-    await interaction.response.send_message(
-        f"✅ {interaction.user.mention} hat **{amount}** Coins an {user.mention} gezahlt.",
-        ephemeral=False
-    )
-
-    await send_log(
-        interaction.guild,
-        category="economy",
-        title="💸 Pay",
-        color=discord.Color.blurple(),
-        user=interaction.user,
-        fields=[
-            ("Von", f"{interaction.user.mention} (`{sender_id}`)", False),
-            ("An", f"{user.mention} (`{recv_id}`)", False),
-            ("Betrag", str(amount), True),
-        ],
-        cooldown_key="pay",
-    )
-
-
-# ==================== Fun/Info Commands ====================
+# ==================== Info Commands (bleiben) ====================
 @bot.tree.command(name="ping", description="Zeigt die Bot-Latenz")
 async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message(f"🏓 Pong: **{round(bot.latency*1000)}ms**", ephemeral=True)
+    await interaction.response.send_message(f"🏓 Pong: **{round(bot.latency * 1000)}ms**", ephemeral=True)
 
 
 @bot.tree.command(name="info", description="Kurze Info über den Bot")
@@ -1607,23 +1466,8 @@ async def info(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"🤖 **{bot.user}**\n"
         f"Servers: **{len(bot.guilds)}**\n"
-        f"Latency: **{round(bot.latency*1000)}ms**",
-        ephemeral=True
-    )
-
-
-@bot.tree.command(name="helpme", description="Zeigt eine Befehlsübersicht")
-async def helpme(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        "✅ **Commands**\n"
-        "Moderation: /clear /kick /ban /timeout /mute /unmute /mute_setup\n"
-        "Tickets: /ticket_setup /ticket create /ticket close\n"
-        "Roles: /role_setup\n"
-        "Economy: /balance /daily /pay\n"
-        "History: /history user /history top /history clear\n"
-        "Fun: /roll /coinflip /8ball\n"
-        "Info: /ping /info /avatar /userinfo /serverinfo",
-        ephemeral=True
+        f"Latency: **{round(bot.latency * 1000)}ms**",
+        ephemeral=True,
     )
 
 
@@ -1664,28 +1508,17 @@ async def serverinfo(interaction: discord.Interaction):
     await interaction.response.send_message(embed=emb, ephemeral=True)
 
 
-@bot.tree.command(name="roll", description="Würfeln (Standard 1-100)")
-@app_commands.describe(maximum="Max (optional)")
-async def roll(interaction: discord.Interaction, maximum: int | None = None):
-    maximum = maximum or 100
-    maximum = max(1, min(100000, maximum))
-    value = random.randint(1, maximum)
-    await interaction.response.send_message(f"🎲 {interaction.user.mention} rolled **{value}** (1-{maximum})")
-
-
-@bot.tree.command(name="coinflip", description="Kopf oder Zahl")
-async def coinflip(interaction: discord.Interaction):
-    await interaction.response.send_message(f"🪙 Ergebnis: **{random.choice(['Kopf', 'Zahl'])}**")
-
-
-@bot.tree.command(name="8ball", description="Magic 8 Ball")
-@app_commands.describe(frage="Deine Frage")
-async def eightball(interaction: discord.Interaction, frage: str):
-    answers = [
-        "Ja.", "Nein.", "Vielleicht.", "Sehr wahrscheinlich.", "Unwahrscheinlich.",
-        "Frag später nochmal.", "Ich glaube schon.", "Auf keinen Fall.", "Sieht gut aus.", "Keine Ahnung."
-    ]
-    await interaction.response.send_message(f"🎱 Frage: **{frage}**\nAntwort: **{random.choice(answers)}**")
+@bot.tree.command(name="helpme", description="Zeigt eine Befehlsübersicht")
+async def helpme(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "✅ **Commands**\n"
+        "Moderation: /clear /kick /ban /mute /unmute /mute_setup\n"
+        "Tickets: /ticket_setup /ticket create /ticket close\n"
+        "Roles: /role_setup\n"
+        "History: /history user /history top /history clear\n"
+        "Info: /ping /info /avatar /userinfo /serverinfo",
+        ephemeral=True,
+    )
 
 
 # ==================== Muted Message Enforcement ====================
@@ -1704,7 +1537,7 @@ async def on_message(message: discord.Message):
         if UNMUTE_CHANNEL_ID and isinstance(message.channel, discord.TextChannel) and message.channel.id == UNMUTE_CHANNEL_ID:
             return await bot.process_commands(message)
 
-        # Allow: own ticket channel (topic user_id=member.id AND in ticket category)
+        # Allow: own ticket channel (topic user_id=member.id AND optional category match)
         allowed = False
         if isinstance(message.channel, discord.TextChannel):
             try:
@@ -1805,7 +1638,6 @@ async def auto_unmute_loop():
             if did_unmute:
                 history_mark_unmuted(guild_id, user_id, unmuted_by=0, method="auto")
 
-            if did_unmute:
                 await send_log(
                     guild,
                     category="mod",
@@ -1850,7 +1682,7 @@ async def on_member_join(member: discord.Member):
         emb = discord.Embed(
             title="New user! :D",
             description=f"Welcome {member.mention}",
-            color=discord.Color.green()
+            color=discord.Color.green(),
         )
         emb.set_thumbnail(url=member.display_avatar.url)
         emb.set_image(url=banner_url or member.display_avatar.url)
@@ -1911,8 +1743,10 @@ async def on_guild_join(guild: discord.Guild):
 
 @bot.event
 async def on_ready():
+    # Persistent Views
     bot.add_view(TicketOpenView())
     bot.add_view(RolePanelView())
+    bot.add_view(TicketManageView(ticket_owner_id=0))  # dummy; real view is attached on send
 
     if not auto_unmute_loop.is_running():
         auto_unmute_loop.start()
@@ -1926,17 +1760,6 @@ async def on_ready():
         await bot.tree.sync()
     except Exception as e:
         print("Sync error:", e)
-        # Best effort error log
-        for g in bot.guilds:
-            await send_log(
-                g,
-                category="error",
-                title="⚠️ Command Sync Error",
-                color=discord.Color.red(),
-                description=str(e),
-                ping_roles=True,
-                cooldown_key="sync_error",
-            )
 
 
 bot.run(TOKEN)
