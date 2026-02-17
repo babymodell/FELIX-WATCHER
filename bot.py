@@ -49,8 +49,40 @@ def env_int_list(key: str) -> list[int]:
     return out
 
 
+def env_bool(key: str, default: bool = True) -> bool:
+    v = os.getenv(key)
+    if v is None or v == "":
+        return default
+    v = v.strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
+
+
 WELCOME_CHANNEL_ID = env_int("WELCOME_CHANNEL_ID")
 LOG_CHANNEL_ID = env_int("LOG_CHANNEL_ID")
+
+# Optional: separate log channels by category
+LOG_CHANNEL_MOD_ID = env_int("LOG_CHANNEL_MOD_ID")
+LOG_CHANNEL_TICKET_ID = env_int("LOG_CHANNEL_TICKET_ID")
+LOG_CHANNEL_ECONOMY_ID = env_int("LOG_CHANNEL_ECONOMY_ID")
+LOG_CHANNEL_JOINLEAVE_ID = env_int("LOG_CHANNEL_JOINLEAVE_ID")
+LOG_CHANNEL_HISTORY_ID = env_int("LOG_CHANNEL_HISTORY_ID")
+LOG_CHANNEL_ERROR_ID = env_int("LOG_CHANNEL_ERROR_ID")
+
+# Optional: ping roles by category
+LOG_PING_MOD_ROLE_IDS = env_int_list("LOG_PING_MOD_ROLE_IDS")
+LOG_PING_TICKET_ROLE_IDS = env_int_list("LOG_PING_TICKET_ROLE_IDS")
+LOG_PING_ERROR_ROLE_IDS = env_int_list("LOG_PING_ERROR_ROLE_IDS")
+
+# Optional: toggles
+LOG_ENABLE_MOD = env_bool("LOG_ENABLE_MOD", True)
+LOG_ENABLE_TICKET = env_bool("LOG_ENABLE_TICKET", True)
+LOG_ENABLE_ECONOMY = env_bool("LOG_ENABLE_ECONOMY", True)
+LOG_ENABLE_JOINLEAVE = env_bool("LOG_ENABLE_JOINLEAVE", True)
+LOG_ENABLE_HISTORY = env_bool("LOG_ENABLE_HISTORY", True)
+LOG_ENABLE_ERROR = env_bool("LOG_ENABLE_ERROR", True)
+
+# Optional: log spam protection (seconds)
+LOG_COOLDOWN_SECONDS = env_int("LOG_COOLDOWN_SECONDS") or 0
 
 TICKET_CATEGORY_ID = env_int("TICKET_CATEGORY_ID")
 TICKET_PANEL_CHANNEL_ID = env_int("TICKET_PANEL_CHANNEL_ID")
@@ -63,37 +95,6 @@ ROLE_POLAND_ID = env_int("ROLE_POLAND_ID")
 ROLE_GERMANY_ID = env_int("ROLE_GERMANY_ID")
 
 TRANSCRIPT_LIMIT = env_int("TICKET_TRANSCRIPT_LIMIT") or 200
-
-# ---- MARKET (keine Threads, keine extra Channels) ----
-MARKET_BERLIN_PANEL_CHANNEL_ID = env_int("MARKET_BERLIN_PANEL_CHANNEL_ID")
-MARKET_BERLIN_LISTINGS_CHANNEL_ID = env_int("MARKET_BERLIN_LISTINGS_CHANNEL_ID")
-MARKET_BERLIN_STAFF_ROLE_IDS = env_int_list("MARKET_BERLIN_STAFF_ROLE_ID")
-
-MARKET_POLAND_PANEL_CHANNEL_ID = env_int("MARKET_POLAND_PANEL_CHANNEL_ID")
-MARKET_POLAND_LISTINGS_CHANNEL_ID = env_int("MARKET_POLAND_LISTINGS_CHANNEL_ID")
-MARKET_POLAND_STAFF_ROLE_IDS = env_int_list("MARKET_POLAND_STAFF_ROLE_ID")
-
-MARKET_ALLOWED_ROLE_BERLIN = ROLE_GERMANY_ID
-MARKET_ALLOWED_ROLE_POLAND = ROLE_POLAND_ID
-
-MARKET_CFG = {
-    "berlin": {
-        "label": "Berlin",
-        "allowed_role_id": MARKET_ALLOWED_ROLE_BERLIN,
-        "panel_channel_id": MARKET_BERLIN_PANEL_CHANNEL_ID,
-        "listings_channel_id": MARKET_BERLIN_LISTINGS_CHANNEL_ID,
-        "staff_role_ids": MARKET_BERLIN_STAFF_ROLE_IDS,
-        "lang": "de",
-    },
-    "poland": {
-        "label": "Polska",
-        "allowed_role_id": MARKET_ALLOWED_ROLE_POLAND,
-        "panel_channel_id": MARKET_POLAND_PANEL_CHANNEL_ID,
-        "listings_channel_id": MARKET_POLAND_LISTINGS_CHANNEL_ID,
-        "staff_role_ids": MARKET_POLAND_STAFF_ROLE_IDS,
-        "lang": "pl",
-    }
-}
 
 if not TOKEN:
     raise SystemExit("❌ DISCORD_BOT_TOKEN fehlt als Environment Variable (Railway Variables).")
@@ -126,13 +127,28 @@ def db():
             PRIMARY KEY (guild_id, user_id)
         )
     """)
-    # NEU: Rollen-Backup für Mutes
+    # Rollen-Backup für Mutes
     conn.execute("""
         CREATE TABLE IF NOT EXISTS mute_role_backup (
             guild_id INTEGER NOT NULL,
             user_id INTEGER NOT NULL,
             role_ids TEXT NOT NULL,
             PRIMARY KEY (guild_id, user_id)
+        )
+    """)
+    # Mute-History
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mute_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            moderator_id INTEGER NOT NULL,
+            reason TEXT,
+            muted_at TEXT NOT NULL,
+            duration_minutes INTEGER,
+            unmuted_at TEXT,
+            unmuted_by INTEGER,
+            unmute_method TEXT
         )
     """)
     return conn
@@ -155,69 +171,21 @@ def now_utc() -> datetime.datetime:
     return datetime.datetime.now(datetime.UTC)
 
 
+def _fmt_dt_short(iso: str | None) -> str:
+    if not iso:
+        return "—"
+    try:
+        dt = datetime.datetime.fromisoformat(iso)
+        return f"<t:{int(dt.timestamp())}:f> (<t:{int(dt.timestamp())}:R>)"
+    except Exception:
+        return iso
+
+
 async def get_text_channel(guild: discord.Guild, channel_id: int | None) -> discord.TextChannel | None:
     if not channel_id:
         return None
     ch = guild.get_channel(channel_id)
     return ch if isinstance(ch, discord.TextChannel) else None
-
-
-async def get_log_channel(guild: discord.Guild) -> discord.TextChannel | None:
-    return await get_text_channel(guild, LOG_CHANNEL_ID)
-
-
-async def send_log(
-    guild: discord.Guild,
-    *,
-    title: str,
-    description: str = "",
-    color: discord.Color = discord.Color.blurple(),
-    fields: list[tuple[str, str, bool]] | None = None,
-    user: discord.abc.User | None = None,
-    file: discord.File | None = None,
-):
-    log_ch = await get_log_channel(guild)
-    if not log_ch:
-        return
-
-    emb = discord.Embed(title=title, description=description, color=color, timestamp=now_utc())
-    if user is not None:
-        try:
-            emb.set_author(name=str(user), icon_url=user.display_avatar.url)
-        except Exception:
-            emb.set_author(name=str(user))
-
-    if fields:
-        for name, value, inline in fields:
-            emb.add_field(name=name, value=value or "—", inline=inline)
-
-    try:
-        if file is not None:
-            await log_ch.send(embed=emb, file=file)
-        else:
-            await log_ch.send(embed=emb)
-    except discord.Forbidden:
-        pass
-
-
-def fmt_roles(member: discord.Member, limit: int = 18) -> str:
-    roles = [r.mention for r in member.roles if r.name != "@everyone"]
-    if not roles:
-        return "—"
-    if len(roles) > limit:
-        return " ".join(roles[:limit]) + f" …(+{len(roles)-limit})"
-    return " ".join(roles)
-
-
-def discord_account_age(member: discord.Member) -> str:
-    days = (now_utc() - member.created_at).days
-    years = days // 365
-    if years >= 1:
-        return f"vor {years} Jahr(en)"
-    months = days // 30
-    if months >= 1:
-        return f"vor {months} Monat(en)"
-    return f"vor {days} Tag(en)"
 
 
 def has_role(member: discord.Member, role_id: int | None) -> bool:
@@ -239,18 +207,6 @@ def is_staff(member: discord.Member) -> bool:
     return False
 
 
-def is_market_staff(member: discord.Member, staff_role_ids: list[int]) -> bool:
-    if member.guild_permissions.administrator:
-        return True
-    if not staff_role_ids:
-        return False
-    for rid in staff_role_ids:
-        role = member.guild.get_role(rid)
-        if role and role in member.roles:
-            return True
-    return False
-
-
 def staff_check():
     async def predicate(interaction: discord.Interaction) -> bool:
         return (
@@ -259,6 +215,26 @@ def staff_check():
             is_staff(interaction.user)
         )
     return app_commands.check(predicate)
+
+
+def fmt_roles(member: discord.Member, limit: int = 18) -> str:
+    roles = [r.mention for r in member.roles if r.name != "@everyone"]
+    if not roles:
+        return "—"
+    if len(roles) > limit:
+        return " ".join(roles[:limit]) + f" …(+{len(roles)-limit})"
+    return " ".join(roles)
+
+
+def discord_account_age(member: discord.Member) -> str:
+    days = (now_utc() - member.created_at).days
+    years = days // 365
+    if years >= 1:
+        return f"vor {years} Jahr(en)"
+    months = days // 30
+    if months >= 1:
+        return f"vor {months} Monat(en)"
+    return f"vor {days} Tag(en)"
 
 
 async def refresh_invites_for_guild(guild: discord.Guild):
@@ -347,6 +323,115 @@ async def build_text_channel_transcript(channel: discord.TextChannel, limit: int
     return "\n".join(lines)
 
 
+# ==================== Extended Log System ====================
+_log_last_sent: dict[tuple[int, str], float] = {}
+
+
+def _log_enabled(cat: str) -> bool:
+    cat = (cat or "default").lower()
+    if cat == "mod":
+        return LOG_ENABLE_MOD
+    if cat == "ticket":
+        return LOG_ENABLE_TICKET
+    if cat == "economy":
+        return LOG_ENABLE_ECONOMY
+    if cat == "joinleave":
+        return LOG_ENABLE_JOINLEAVE
+    if cat == "history":
+        return LOG_ENABLE_HISTORY
+    if cat == "error":
+        return LOG_ENABLE_ERROR
+    return True
+
+
+def _log_channel_id_for_category(cat: str) -> int | None:
+    cat = (cat or "default").lower()
+    if cat == "mod":
+        return LOG_CHANNEL_MOD_ID or LOG_CHANNEL_ID
+    if cat == "ticket":
+        return LOG_CHANNEL_TICKET_ID or LOG_CHANNEL_ID
+    if cat == "economy":
+        return LOG_CHANNEL_ECONOMY_ID or LOG_CHANNEL_ID
+    if cat == "joinleave":
+        return LOG_CHANNEL_JOINLEAVE_ID or LOG_CHANNEL_ID
+    if cat == "history":
+        return LOG_CHANNEL_HISTORY_ID or LOG_CHANNEL_ID
+    if cat == "error":
+        return LOG_CHANNEL_ERROR_ID or LOG_CHANNEL_ID
+    return LOG_CHANNEL_ID
+
+
+def _log_ping_role_ids(cat: str) -> list[int]:
+    cat = (cat or "default").lower()
+    if cat == "mod":
+        return LOG_PING_MOD_ROLE_IDS
+    if cat == "ticket":
+        return LOG_PING_TICKET_ROLE_IDS
+    if cat == "error":
+        return LOG_PING_ERROR_ROLE_IDS
+    return []
+
+
+async def get_log_channel_for(guild: discord.Guild, category: str) -> discord.TextChannel | None:
+    cid = _log_channel_id_for_category(category)
+    return await get_text_channel(guild, cid)
+
+
+async def send_log(
+    guild: discord.Guild,
+    *,
+    category: str = "default",
+    title: str,
+    description: str = "",
+    color: discord.Color = discord.Color.blurple(),
+    fields: list[tuple[str, str, bool]] | None = None,
+    user: discord.abc.User | None = None,
+    file: discord.File | None = None,
+    ping_roles: bool = False,
+    cooldown_key: str | None = None,
+):
+    if not _log_enabled(category):
+        return
+
+    log_ch = await get_log_channel_for(guild, category)
+    if not log_ch:
+        return
+
+    # Cooldown per guild+key/category to prevent spam (optional)
+    if LOG_COOLDOWN_SECONDS and LOG_COOLDOWN_SECONDS > 0:
+        key = cooldown_key or category
+        now_ts = datetime.datetime.now().timestamp()
+        last = _log_last_sent.get((guild.id, key), 0.0)
+        if now_ts - last < LOG_COOLDOWN_SECONDS:
+            return
+        _log_last_sent[(guild.id, key)] = now_ts
+
+    emb = discord.Embed(title=title, description=description, color=color, timestamp=now_utc())
+    if user is not None:
+        try:
+            emb.set_author(name=str(user), icon_url=user.display_avatar.url)
+        except Exception:
+            emb.set_author(name=str(user))
+
+    if fields:
+        for name, value, inline in fields:
+            emb.add_field(name=name, value=value or "—", inline=inline)
+
+    content = None
+    if ping_roles:
+        ids = _log_ping_role_ids(category)
+        if ids:
+            content = " ".join(f"<@&{rid}>" for rid in ids)
+
+    try:
+        if file is not None:
+            await log_ch.send(content=content, embed=emb, file=file)
+        else:
+            await log_ch.send(content=content, embed=emb)
+    except discord.Forbidden:
+        pass
+
+
 # ==================== Mute Role Backup Helpers ====================
 def _serialize_role_ids(role_ids: list[int]) -> str:
     return ",".join(str(r) for r in role_ids)
@@ -399,6 +484,102 @@ def can_bot_manage_role(guild: discord.Guild, role: discord.Role) -> bool:
     if not me:
         return False
     return me.top_role > role
+
+
+# ==================== Mute History Helpers ====================
+def history_add_mute(guild_id: int, user_id: int, moderator_id: int, reason: str, duration_minutes: int | None):
+    conn = db()
+    try:
+        conn.execute(
+            """
+            INSERT INTO mute_history(guild_id, user_id, moderator_id, reason, muted_at, duration_minutes)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (guild_id, user_id, moderator_id, reason, now_utc().isoformat(), duration_minutes)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def history_mark_unmuted(guild_id: int, user_id: int, unmuted_by: int, method: str):
+    conn = db()
+    try:
+        row = conn.execute(
+            """
+            SELECT id FROM mute_history
+            WHERE guild_id=? AND user_id=? AND unmuted_at IS NULL
+            ORDER BY id DESC LIMIT 1
+            """,
+            (guild_id, user_id)
+        ).fetchone()
+        if not row:
+            return
+        conn.execute(
+            """
+            UPDATE mute_history
+            SET unmuted_at=?, unmuted_by=?, unmute_method=?
+            WHERE id=?
+            """,
+            (now_utc().isoformat(), unmuted_by, method, int(row[0]))
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def history_fetch(guild_id: int, user_id: int, limit: int = 10) -> tuple[int, list[tuple]]:
+    conn = db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT moderator_id, reason, muted_at, duration_minutes, unmuted_at, unmuted_by, unmute_method
+            FROM mute_history
+            WHERE guild_id=? AND user_id=?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (guild_id, user_id, int(limit))
+        ).fetchall()
+        total = conn.execute(
+            "SELECT COUNT(*) FROM mute_history WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id)
+        ).fetchone()[0]
+        return int(total), rows
+    finally:
+        conn.close()
+
+
+def history_clear_user(guild_id: int, user_id: int) -> int:
+    conn = db()
+    try:
+        cur = conn.execute(
+            "DELETE FROM mute_history WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id)
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+    finally:
+        conn.close()
+
+
+def history_top(guild_id: int, limit: int = 10) -> list[tuple[int, int]]:
+    conn = db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT user_id, COUNT(*) AS c
+            FROM mute_history
+            WHERE guild_id=?
+            GROUP BY user_id
+            ORDER BY c DESC
+            LIMIT ?
+            """,
+            (guild_id, int(limit))
+        ).fetchall()
+        return [(int(r[0]), int(r[1])) for r in rows]
+    finally:
+        conn.close()
 
 
 # ==================== Ticket Helpers ====================
@@ -479,13 +660,25 @@ class RolePanelView(discord.ui.View):
             if role in member.roles:
                 await member.remove_roles(role, reason="Role Panel toggle")
                 await interaction.response.send_message(f"❌ Rolle entfernt: {role.mention}", ephemeral=True)
-                await send_log(interaction.guild, title="➖ Rolle entfernt (Panel)", color=discord.Color.red(),
-                               user=member, fields=[("Rolle", role.mention, True)])
+                await send_log(
+                    interaction.guild,
+                    category="mod",
+                    title="➖ Rolle entfernt (Panel)",
+                    color=discord.Color.red(),
+                    user=member,
+                    fields=[("Rolle", role.mention, True)]
+                )
             else:
                 await member.add_roles(role, reason="Role Panel toggle")
                 await interaction.response.send_message(f"✅ Rolle bekommen: {role.mention}", ephemeral=True)
-                await send_log(interaction.guild, title="➕ Rolle hinzugefügt (Panel)", color=discord.Color.green(),
-                               user=member, fields=[("Rolle", role.mention, True)])
+                await send_log(
+                    interaction.guild,
+                    category="mod",
+                    title="➕ Rolle hinzugefügt (Panel)",
+                    color=discord.Color.green(),
+                    user=member,
+                    fields=[("Rolle", role.mention, True)]
+                )
         except discord.Forbidden:
             await interaction.response.send_message("❌ Ich habe keine Rechte Rollen zu vergeben.", ephemeral=True)
 
@@ -538,12 +731,16 @@ class TicketManageView(discord.ui.View):
 
         await send_log(
             interaction.guild,
+            category="ticket",
             title="🔒 Ticket geschlossen",
             color=discord.Color.red(),
             user=interaction.user,
-            fields=[("Channel", f"#{ch.name} (`{ch.id}`)", False),
-                    ("Closed by", f"{interaction.user.mention} (`{interaction.user.id}`)", False)],
+            fields=[
+                ("Channel", f"#{ch.name} (`{ch.id}`)", False),
+                ("Closed by", f"{interaction.user.mention} (`{interaction.user.id}`)", False)
+            ],
             file=f,
+            ping_roles=False,
         )
 
         await asyncio.sleep(5)
@@ -587,11 +784,14 @@ class TicketManageView(discord.ui.View):
 
         await send_log(
             interaction.guild,
+            category="ticket",
             title="🧾 Ticket geclaimt",
             color=discord.Color.gold(),
             user=interaction.user,
-            fields=[("Channel", f"{ch.mention} (`{ch.id}`)", False),
-                    ("Claimed by", f"{interaction.user.mention} (`{interaction.user.id}`)", False)],
+            fields=[
+                ("Channel", f"{ch.mention} (`{ch.id}`)", False),
+                ("Claimed by", f"{interaction.user.mention} (`{interaction.user.id}`)", False)
+            ],
         )
 
 
@@ -655,10 +855,13 @@ class TicketOpenView(discord.ui.View):
 
         await send_log(
             guild,
+            category="ticket",
             title="🎫 Ticket erstellt",
             color=discord.Color.green(),
             user=member,
             fields=[("Channel", f"{ch.mention} (`{ch.id}`)", False), ("Typ", kind, True)],
+            ping_roles=True,  # optional ping staff role ids for ticket category (if configured)
+            cooldown_key="ticket_created",
         )
 
     @discord.ui.button(label="Question", style=discord.ButtonStyle.secondary, emoji="❓", custom_id="ticket_open:question")
@@ -672,325 +875,6 @@ class TicketOpenView(discord.ui.View):
     @discord.ui.button(label="Partnership", style=discord.ButtonStyle.success, emoji="🤝", custom_id="ticket_open:partnership")
     async def partnership(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._create_ticket(interaction, "Partnership", "🤝")
-
-
-# ==================== MARKET (kein Thread, kein extra Channel) ====================
-def market_meta(seller_id: int, region_key: str, claimed_by: int | None) -> str:
-    cb = claimed_by if claimed_by is not None else 0
-    return f"seller_id={seller_id}|region={region_key}|claimed_by={cb}"
-
-
-def parse_market_meta(emb: discord.Embed) -> dict:
-    out = {"seller_id": 0, "region": None, "claimed_by": 0}
-    if not emb.footer or not emb.footer.text:
-        return out
-    txt = emb.footer.text
-    parts = [p.strip() for p in txt.split("|")]
-    for p in parts:
-        if "=" in p:
-            k, v = p.split("=", 1)
-            k = k.strip()
-            v = v.strip()
-            if k == "seller_id":
-                out["seller_id"] = int(v) if v.isdigit() else 0
-            elif k == "region":
-                out["region"] = v
-            elif k == "claimed_by":
-                out["claimed_by"] = int(v) if v.isdigit() else 0
-    return out
-
-
-class MarketListingView(discord.ui.View):
-    def __init__(self, disabled: bool = False):
-        super().__init__(timeout=None)
-        self._disabled = disabled
-        for item in self.children:
-            if isinstance(item, discord.ui.Button):
-                item.disabled = disabled
-
-    @discord.ui.button(label="Kontakt", style=discord.ButtonStyle.primary, emoji="📩", custom_id="market:contact")
-    async def contact(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
-
-        msg = interaction.message
-        if not msg or not msg.embeds:
-            return await interaction.response.send_message("❌ Keine Anzeige gefunden.", ephemeral=True)
-
-        emb = msg.embeds[0]
-        meta = parse_market_meta(emb)
-        region = meta.get("region")
-        seller_id = int(meta.get("seller_id") or 0)
-
-        if not region or seller_id == 0:
-            return await interaction.response.send_message("❌ Anzeige-Metadaten fehlen.", ephemeral=True)
-
-        buyer = interaction.user
-        if buyer.id == seller_id:
-            lang = MARKET_CFG[region]["lang"]
-            return await interaction.response.send_message("❌ Du bist der Verkäufer." if lang != "pl" else "❌ Jesteś sprzedawcą.", ephemeral=True)
-
-        seller = interaction.guild.get_member(seller_id)
-        seller_mention = seller.mention if seller else f"<@{seller_id}>"
-
-        lang = MARKET_CFG[region]["lang"]
-        if lang == "pl":
-            text = f"📩 {buyer.mention} chce skontaktować się ze sprzedawcą {seller_mention}. Napiszcie do siebie na DM i dogadajcie się."
-            ok = "✅ Wysłano ping kontaktowy."
-        else:
-            text = f"📩 {buyer.mention} möchte den Verkäufer {seller_mention} kontaktieren. Bitte per DM klären."
-            ok = "✅ Kontakt gepingt."
-
-        await interaction.response.send_message(ok, ephemeral=True)
-        await msg.channel.send(text)
-
-        await send_log(
-            interaction.guild,
-            title="📩 Market Kontakt",
-            color=discord.Color.blurple(),
-            user=buyer,
-            fields=[
-                ("Region", MARKET_CFG[region]["label"], True),
-                ("Seller", f"{seller_mention} (`{seller_id}`)", False),
-                ("Listing Msg", f"`{msg.id}` in {msg.channel.mention}", False),
-            ],
-        )
-
-    @discord.ui.button(label="Claim", style=discord.ButtonStyle.success, emoji="🧾", custom_id="market:claim")
-    async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
-
-        msg = interaction.message
-        if not msg or not msg.embeds:
-            return await interaction.response.send_message("❌ Keine Anzeige gefunden.", ephemeral=True)
-
-        emb = msg.embeds[0]
-        meta = parse_market_meta(emb)
-        region = meta.get("region")
-        seller_id = int(meta.get("seller_id") or 0)
-        claimed_by = int(meta.get("claimed_by") or 0)
-
-        if not region or seller_id == 0:
-            return await interaction.response.send_message("❌ Anzeige-Metadaten fehlen.", ephemeral=True)
-
-        buyer = interaction.user
-        lang = MARKET_CFG[region]["lang"]
-
-        if buyer.id == seller_id:
-            return await interaction.response.send_message("❌ Verkäufer kann nicht claimen." if lang != "pl" else "❌ Sprzedawca nie może zająć.", ephemeral=True)
-
-        required_role = MARKET_CFG[region]["allowed_role_id"]
-        if required_role and not has_role(buyer, required_role):
-            return await interaction.response.send_message(
-                "❌ Du hast nicht die passende Rolle für diesen Markt." if lang != "pl" else "❌ Nie masz odpowiedniej roli do tego rynku.",
-                ephemeral=True
-            )
-
-        if claimed_by != 0:
-            return await interaction.response.send_message("✅ Bereits geclaimt." if lang != "pl" else "✅ Ogłoszenie jest już zajęte.", ephemeral=True)
-
-        new_emb = emb.copy()
-        status_text = f"🟢 Geclaimt von {buyer.mention}" if lang != "pl" else f"🟢 Zajęte przez {buyer.mention}"
-
-        found = False
-        for i, f in enumerate(new_emb.fields):
-            if f.name.lower() == "status":
-                new_emb.set_field_at(i, name="Status", value=status_text, inline=False)
-                found = True
-                break
-        if not found:
-            new_emb.add_field(name="Status", value=status_text, inline=False)
-
-        new_emb.set_footer(text=market_meta(seller_id=seller_id, region_key=region, claimed_by=buyer.id))
-        await msg.edit(embed=new_emb)
-
-        await interaction.response.send_message("✅ Geclaimt." if lang != "pl" else "✅ Zajęte.", ephemeral=True)
-
-        await send_log(
-            interaction.guild,
-            title="🧾 Market Claim",
-            color=discord.Color.gold(),
-            user=buyer,
-            fields=[
-                ("Region", MARKET_CFG[region]["label"], True),
-                ("Seller ID", str(seller_id), True),
-                ("Claimed by", f"{buyer.mention} (`{buyer.id}`)", False),
-                ("Listing Msg", f"`{msg.id}` in {msg.channel.mention}", False),
-            ],
-        )
-
-    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, emoji="🔒", custom_id="market:close")
-    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
-
-        msg = interaction.message
-        if not msg or not msg.embeds:
-            return await interaction.response.send_message("❌ Keine Anzeige gefunden.", ephemeral=True)
-
-        emb = msg.embeds[0]
-        meta = parse_market_meta(emb)
-        region = meta.get("region")
-        seller_id = int(meta.get("seller_id") or 0)
-        claimed_by = int(meta.get("claimed_by") or 0)
-
-        if not region or seller_id == 0:
-            return await interaction.response.send_message("❌ Anzeige-Metadaten fehlen.", ephemeral=True)
-
-        actor = interaction.user
-        staff_ids = MARKET_CFG[region]["staff_role_ids"]
-        lang = MARKET_CFG[region]["lang"]
-
-        is_owner = actor.id == seller_id
-        if not (is_owner or is_market_staff(actor, staff_ids)):
-            return await interaction.response.send_message(
-                "❌ Nur Verkäufer oder Staff kann schließen." if lang != "pl" else "❌ Tylko sprzedawca lub staff może zamknąć.",
-                ephemeral=True
-            )
-
-        new_emb = emb.copy()
-        closed_text = "🔴 Closed" if lang != "pl" else "🔴 Zamknięte"
-
-        found = False
-        for i, f in enumerate(new_emb.fields):
-            if f.name.lower() == "status":
-                new_emb.set_field_at(i, name="Status", value=closed_text, inline=False)
-                found = True
-                break
-        if not found:
-            new_emb.add_field(name="Status", value=closed_text, inline=False)
-
-        new_emb.set_footer(text=market_meta(seller_id=seller_id, region_key=region, claimed_by=claimed_by))
-
-        await msg.edit(embed=new_emb, view=MarketListingView(disabled=True))
-
-        await interaction.response.send_message("✅ Anzeige geschlossen." if lang != "pl" else "✅ Ogłoszenie zamknięte.", ephemeral=True)
-
-        await send_log(
-            interaction.guild,
-            title="🔒 Market Close",
-            color=discord.Color.red(),
-            user=actor,
-            fields=[
-                ("Region", MARKET_CFG[region]["label"], True),
-                ("Seller ID", str(seller_id), True),
-                ("Closed by", f"{actor.mention} (`{actor.id}`)", False),
-                ("Listing Msg", f"`{msg.id}` in {msg.channel.mention}", False),
-            ],
-        )
-
-
-class MarketSaleModal(discord.ui.Modal):
-    def __init__(self, opener: discord.Member, region_key: str):
-        self.opener = opener
-        self.region_key = region_key
-        lang = MARKET_CFG[region_key]["lang"]
-
-        title = "Sprzedaż bezpośrednia" if lang == "pl" else "Direktverkauf"
-        super().__init__(title=f"{title} ({MARKET_CFG[region_key]['label']})")
-
-        if lang == "pl":
-            self.item = discord.ui.TextInput(label="Co sprzedajesz?", max_length=200)
-            self.price = discord.ui.TextInput(label="Cena", max_length=80)
-            self.location = discord.ui.TextInput(label="Miejsce/Info", required=False, max_length=120)
-            self.contact = discord.ui.TextInput(label="Kontakt/Godziny", required=False, max_length=150)
-        else:
-            self.item = discord.ui.TextInput(label="Was verkaufst du?", max_length=200)
-            self.price = discord.ui.TextInput(label="Preis", max_length=80)
-            self.location = discord.ui.TextInput(label="Ort/Info", required=False, max_length=120)
-            self.contact = discord.ui.TextInput(label="Kontakt/Zeiten", required=False, max_length=150)
-
-        self.add_item(self.item)
-        self.add_item(self.price)
-        self.add_item(self.location)
-        self.add_item(self.contact)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
-
-        guild = interaction.guild
-        member = self.opener
-        cfg = MARKET_CFG[self.region_key]
-        lang = cfg["lang"]
-
-        if not has_role(member, cfg["allowed_role_id"]):
-            return await interaction.response.send_message(
-                "❌ Du hast nicht die Rolle für diesen Markt." if lang != "pl" else "❌ Nie masz roli do tego rynku.",
-                ephemeral=True
-            )
-
-        listings_ch = await get_text_channel(guild, cfg["listings_channel_id"])
-        if not isinstance(listings_ch, discord.TextChannel):
-            return await interaction.response.send_message("❌ Listings-Channel nicht gefunden (ID prüfen).", ephemeral=True)
-
-        if lang == "pl":
-            emb = discord.Embed(
-                title=f"🛒 Sprzedaż bezpośrednia ({cfg['label']})",
-                description=f"Sprzedawca: {member.mention}",
-                color=discord.Color.green()
-            )
-            emb.add_field(name="Przedmiot", value=str(self.item), inline=False)
-            emb.add_field(name="Cena", value=str(self.price), inline=True)
-            emb.add_field(name="Miejsce/Info", value=(str(self.location).strip() or "—"), inline=True)
-            emb.add_field(name="Kontakt/Godziny", value=(str(self.contact).strip() or "—"), inline=False)
-            emb.add_field(name="Status", value="🟡 Otwarte", inline=False)
-        else:
-            emb = discord.Embed(
-                title=f"🛒 Direktverkauf ({cfg['label']})",
-                description=f"Seller: {member.mention}",
-                color=discord.Color.green()
-            )
-            emb.add_field(name="Item", value=str(self.item), inline=False)
-            emb.add_field(name="Preis", value=str(self.price), inline=True)
-            emb.add_field(name="Ort/Info", value=(str(self.location).strip() or "—"), inline=True)
-            emb.add_field(name="Kontakt/Zeiten", value=(str(self.contact).strip() or "—"), inline=False)
-            emb.add_field(name="Status", value="🟡 Open", inline=False)
-
-        emb.set_thumbnail(url=member.display_avatar.url)
-        emb.set_footer(text=market_meta(seller_id=member.id, region_key=self.region_key, claimed_by=None))
-
-        await listings_ch.send(embed=emb, view=MarketListingView(disabled=False))
-
-        await interaction.response.send_message(
-            f"✅ Anzeige gepostet in {listings_ch.mention}." if lang != "pl" else f"✅ Ogłoszenie dodane w {listings_ch.mention}.",
-            ephemeral=True
-        )
-
-        await send_log(
-            guild,
-            title="💸 Market Listing erstellt",
-            color=discord.Color.green(),
-            user=member,
-            fields=[("Region", cfg["label"], True), ("Channel", listings_ch.mention, True)],
-        )
-
-
-class MarketOpenViewBerlin(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Direktverkauf starten (Berlin)", style=discord.ButtonStyle.success, emoji="💸", custom_id="market_open:berlin")
-    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
-        if not has_role(interaction.user, MARKET_CFG["berlin"]["allowed_role_id"]):
-            return await interaction.response.send_message("❌ Du brauchst die Berlin/Germany Rolle.", ephemeral=True)
-        await interaction.response.send_modal(MarketSaleModal(opener=interaction.user, region_key="berlin"))
-
-
-class MarketOpenViewPoland(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Rozpocznij sprzedaż (Polska)", style=discord.ButtonStyle.success, emoji="💸", custom_id="market_open:poland")
-    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            return await interaction.response.send_message("Tylko na serwerze.", ephemeral=True)
-        if not has_role(interaction.user, MARKET_CFG["poland"]["allowed_role_id"]):
-            return await interaction.response.send_message("❌ Potrzebujesz roli Polska.", ephemeral=True)
-        await interaction.response.send_modal(MarketSaleModal(opener=interaction.user, region_key="poland"))
 
 
 # ==================== Economy Helpers ====================
@@ -1085,50 +969,6 @@ async def role_setup(interaction: discord.Interaction):
     await interaction.response.send_message(f"✅ Rollen-Panel gepostet in {ch.mention}", ephemeral=True)
 
 
-@bot.tree.command(name="market_setup_berlin", description="Postet Direktverkauf Panel (Berlin) (Staff/Admin)")
-@staff_check()
-async def market_setup_berlin(interaction: discord.Interaction):
-    if not interaction.guild:
-        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
-    cfg = MARKET_CFG["berlin"]
-    if not cfg["panel_channel_id"]:
-        return await interaction.response.send_message("❌ MARKET_BERLIN_PANEL_CHANNEL_ID fehlt.", ephemeral=True)
-
-    panel_ch = interaction.guild.get_channel(cfg["panel_channel_id"])
-    if not isinstance(panel_ch, discord.TextChannel):
-        return await interaction.response.send_message("❌ Berlin Panel-Channel nicht gefunden.", ephemeral=True)
-
-    embed = discord.Embed(
-        title="💸 Direktverkauf (Berlin)",
-        description="Klicke unten, fülle das Formular aus und dein Verkauf wird als Anzeige im Markt gepostet.",
-        color=discord.Color.green()
-    )
-    await panel_ch.send(embed=embed, view=MarketOpenViewBerlin())
-    await interaction.response.send_message(f"✅ Berlin Direktverkauf-Panel gepostet in {panel_ch.mention}", ephemeral=True)
-
-
-@bot.tree.command(name="market_setup_poland", description="Postuje panel sprzedaży (Polska) (Staff/Admin)")
-@staff_check()
-async def market_setup_poland(interaction: discord.Interaction):
-    if not interaction.guild:
-        return await interaction.response.send_message("Tylko na serwerze.", ephemeral=True)
-    cfg = MARKET_CFG["poland"]
-    if not cfg["panel_channel_id"]:
-        return await interaction.response.send_message("❌ Brak MARKET_POLAND_PANEL_CHANNEL_ID.", ephemeral=True)
-
-    panel_ch = interaction.guild.get_channel(cfg["panel_channel_id"])
-    if not isinstance(panel_ch, discord.TextChannel):
-        return await interaction.response.send_message("❌ Nie znaleziono kanału panelu (Polska).", ephemeral=True)
-
-    embed = discord.Embed(
-        title="💸 Sprzedaż bezpośrednia (Polska)",
-        description="Kliknij poniżej, wypełnij formularz, a ogłoszenie pojawi się na rynku.",
-        color=discord.Color.green()
-    )
-    await panel_ch.send(embed=embed, view=MarketOpenViewPoland())
-    await interaction.response.send_message(f"✅ Panel Polska wysłany w {panel_ch.mention}", ephemeral=True)
-
-
 # ==================== Commands: Ticket direct ====================
 ticket_group = app_commands.Group(name="ticket", description="Ticket Commands")
 
@@ -1169,6 +1009,7 @@ async def ticket_close(interaction: discord.Interaction):
 
     await send_log(
         interaction.guild,
+        category="ticket",
         title="🔒 Ticket geschlossen",
         color=discord.Color.red(),
         user=interaction.user,
@@ -1204,6 +1045,7 @@ async def clear(interaction: discord.Interaction, anzahl: int):
 
     await send_log(
         interaction.guild,
+        category="mod",
         title="🧹 Messages gelöscht",
         color=discord.Color.blurple(),
         user=interaction.user,
@@ -1226,6 +1068,7 @@ async def kick(interaction: discord.Interaction, user: discord.Member, grund: st
 
         await send_log(
             interaction.guild,
+            category="mod",
             title="👢 Kick",
             color=discord.Color.orange(),
             user=user,
@@ -1252,6 +1095,7 @@ async def ban(interaction: discord.Interaction, user: discord.Member, grund: str
 
         await send_log(
             interaction.guild,
+            category="mod",
             title="⛔ Ban",
             color=discord.Color.red(),
             user=user,
@@ -1281,6 +1125,7 @@ async def timeout(interaction: discord.Interaction, user: discord.Member, minute
 
         await send_log(
             interaction.guild,
+            category="mod",
             title="⏳ Timeout",
             color=discord.Color.orange(),
             user=user,
@@ -1386,6 +1231,9 @@ async def mute(interaction: discord.Interaction, user: discord.Member, minuten: 
     finally:
         conn.close()
 
+    # History entry
+    history_add_mute(interaction.guild.id, user.id, interaction.user.id, grund, minuten if (minuten and minuten > 0) else None)
+
     unmute_ch = interaction.guild.get_channel(UNMUTE_CHANNEL_ID)
     unmute_hint = f"#{unmute_ch.name}" if isinstance(unmute_ch, discord.TextChannel) else "den Unmute-Channel"
     dauer_txt = f"{minuten} Minuten" if (minuten and minuten > 0) else "unbestimmt"
@@ -1404,7 +1252,6 @@ async def mute(interaction: discord.Interaction, user: discord.Member, minuten: 
 
     await interaction.followup.send(f"🔇 {user.mention} wurde gemutet. Dauer: {dauer_txt}", ephemeral=True)
 
-    # Fail-safe Log: welche Rollen konnten nicht entfernt werden?
     cannot_txt = "—"
     if cannot_remove:
         cannot_txt = " ".join(r.mention for r in cannot_remove[:20])
@@ -1413,6 +1260,7 @@ async def mute(interaction: discord.Interaction, user: discord.Member, minuten: 
 
     await send_log(
         interaction.guild,
+        category="mod",
         title="🔇 User gemutet",
         color=discord.Color.orange(),
         user=user,
@@ -1425,6 +1273,25 @@ async def mute(interaction: discord.Interaction, user: discord.Member, minuten: 
             ("Rollen entfernt", str(removed_count), True),
             ("Nicht entfernbar", cannot_txt, False),
         ],
+        ping_roles=True,
+        cooldown_key=f"mute:{user.id}",
+    )
+
+    # Extra history log category
+    await send_log(
+        interaction.guild,
+        category="history",
+        title="📜 Mute-History (Eintrag hinzugefügt)",
+        color=discord.Color.blurple(),
+        user=user,
+        fields=[
+            ("User", f"{user.mention} (`{user.id}`)", False),
+            ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
+            ("Grund", grund, False),
+            ("Dauer", dauer_txt, True),
+            ("Zeit", _fmt_dt_short(now_utc().isoformat()), False),
+        ],
+        cooldown_key=f"history_mute:{user.id}",
     )
 
 
@@ -1438,13 +1305,11 @@ async def unmute(interaction: discord.Interaction, user: discord.Member):
     if not muted_role or muted_role not in user.roles:
         return await interaction.response.send_message("User ist nicht gemutet.", ephemeral=True)
 
-    # Muted entfernen
     try:
         await user.remove_roles(muted_role, reason=f"Unmuted von {interaction.user}")
     except discord.Forbidden:
         return await interaction.response.send_message("❌ Ich habe keine Rechte, Rollen zu entfernen.", ephemeral=True)
 
-    # Rollen wiederherstellen
     role_ids = pop_mute_roles_backup(interaction.guild.id, user.id)
     to_add: list[discord.Role] = []
     skipped = 0
@@ -1479,6 +1344,8 @@ async def unmute(interaction: discord.Interaction, user: discord.Member):
     finally:
         conn.close()
 
+    history_mark_unmuted(interaction.guild.id, user.id, interaction.user.id, "manual")
+
     try:
         await user.send(f"✅ Du wurdest auf **{interaction.guild.name}** entmutet.")
     except Exception:
@@ -1491,6 +1358,7 @@ async def unmute(interaction: discord.Interaction, user: discord.Member):
 
     await send_log(
         interaction.guild,
+        category="mod",
         title="🔊 User entmutet",
         color=discord.Color.green(),
         user=user,
@@ -1501,8 +1369,134 @@ async def unmute(interaction: discord.Interaction, user: discord.Member):
             ("Rollen skipped", str(skipped), True),
             ("Add Roles failed", "Ja" if add_failed else "Nein", True),
         ],
+        cooldown_key=f"unmute:{user.id}",
     )
 
+    await send_log(
+        interaction.guild,
+        category="history",
+        title="📜 Mute-History (Unmute eingetragen)",
+        color=discord.Color.blurple(),
+        user=user,
+        fields=[
+            ("User", f"{user.mention} (`{user.id}`)", False),
+            ("Unmuted by", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
+            ("Method", "`manual`", True),
+            ("Zeit", _fmt_dt_short(now_utc().isoformat()), False),
+        ],
+        cooldown_key=f"history_unmute:{user.id}",
+    )
+
+
+# ==================== History Commands ====================
+history_group = app_commands.Group(name="history", description="History Commands")
+
+
+@history_group.command(name="user", description="Zeigt Mute-History eines Users")
+@staff_check()
+@app_commands.describe(user="User", limit="Wie viele Einträge (1-20)")
+async def history_user(interaction: discord.Interaction, user: discord.Member, limit: int | None = 10):
+    if not interaction.guild:
+        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+
+    limit = max(1, min(20, int(limit or 10)))
+    total, rows = history_fetch(interaction.guild.id, user.id, limit=limit)
+
+    if total == 0:
+        return await interaction.response.send_message(f"📜 Keine Mute-History für {user.mention}.", ephemeral=True)
+
+    emb = discord.Embed(
+        title="📜 Mute History",
+        description=f"User: {user.mention} (`{user.id}`)\nTotal Mutes: **{total}**\nZeige letzte **{len(rows)}** Einträge:",
+        color=discord.Color.orange()
+    )
+    emb.set_thumbnail(url=user.display_avatar.url)
+
+    for idx, (moderator_id, reason, muted_at, duration_minutes, unmuted_at, unmuted_by, unmute_method) in enumerate(rows, start=1):
+        mod_txt = f"<@{int(moderator_id)}>" if moderator_id else "—"
+        reason_txt = (reason or "—")
+        dur_txt = f"{duration_minutes} min" if duration_minutes else "unbestimmt"
+        muted_txt = _fmt_dt_short(muted_at)
+
+        if unmuted_at:
+            um_txt = _fmt_dt_short(unmuted_at)
+            um_by = f"<@{int(unmuted_by)}>" if unmuted_by else "—"
+            um_method = unmute_method or "—"
+            status = f"✅ Unmuted: {um_txt}\nBy: {um_by} • Method: `{um_method}`"
+        else:
+            status = "🔇 Aktuell/offen (kein Unmute gespeichert)"
+
+        emb.add_field(
+            name=f"#{idx} • {muted_txt}",
+            value=(
+                f"Moderator: {mod_txt}\n"
+                f"Dauer: **{dur_txt}**\n"
+                f"Grund: {reason_txt}\n"
+                f"{status}"
+            ),
+            inline=False
+        )
+
+    await interaction.response.send_message(embed=emb, ephemeral=True)
+
+
+@history_group.command(name="clear", description="Löscht die Mute-History eines Users")
+@staff_check()
+@app_commands.describe(user="User")
+async def history_clear(interaction: discord.Interaction, user: discord.Member):
+    if not interaction.guild:
+        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+
+    deleted = history_clear_user(interaction.guild.id, user.id)
+    await interaction.response.send_message(
+        f"🧹 Mute-History für {user.mention} gelöscht: **{deleted}** Eintrag/Einträge.",
+        ephemeral=True
+    )
+
+    await send_log(
+        interaction.guild,
+        category="history",
+        title="🧹 Mute-History gelöscht",
+        color=discord.Color.red(),
+        user=interaction.user,
+        fields=[
+            ("User", f"{user.mention} (`{user.id}`)", False),
+            ("Gelöscht", str(deleted), True),
+        ],
+        cooldown_key=f"history_clear:{user.id}",
+    )
+
+
+@history_group.command(name="top", description="Top 10: Meist gemutete User im Server")
+@staff_check()
+@app_commands.describe(limit="Wie viele anzeigen (1-20)")
+async def history_top_cmd(interaction: discord.Interaction, limit: int | None = 10):
+    if not interaction.guild:
+        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+
+    limit = max(1, min(20, int(limit or 10)))
+    top = history_top(interaction.guild.id, limit=limit)
+
+    if not top:
+        return await interaction.response.send_message("📊 Keine Mute-History vorhanden.", ephemeral=True)
+
+    emb = discord.Embed(
+        title="📊 Mute Top List",
+        description=f"Top **{len(top)}** (nach Anzahl Mutes)",
+        color=discord.Color.orange()
+    )
+
+    lines = []
+    for i, (uid, cnt) in enumerate(top, start=1):
+        m = interaction.guild.get_member(uid)
+        mention = m.mention if m else f"<@{uid}>"
+        lines.append(f"**#{i}** {mention} — **{cnt}**")
+
+    emb.add_field(name="Ranking", value="\n".join(lines), inline=False)
+    await interaction.response.send_message(embed=emb, ephemeral=True)
+
+
+bot.tree.add_command(history_group)
 
 # ==================== Economy Commands ====================
 @bot.tree.command(name="balance", description="Zeigt den Kontostand")
@@ -1544,6 +1538,20 @@ async def daily(interaction: discord.Interaction):
     econ_set_daily(guild_id, user_id, now.isoformat())
     await interaction.response.send_message(f"✅ Daily erhalten: **+{reward}** Coins. (Neu: {bal + reward})", ephemeral=True)
 
+    await send_log(
+        interaction.guild,
+        category="economy",
+        title="💸 Daily benutzt",
+        color=discord.Color.green(),
+        user=interaction.user,
+        fields=[
+            ("User", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
+            ("Reward", f"+{reward}", True),
+            ("Neuer Stand", str(bal + reward), True),
+        ],
+        cooldown_key=f"daily:{interaction.user.id}",
+    )
+
 
 @bot.tree.command(name="pay", description="Zahle Coins an einen User")
 @app_commands.describe(user="Empfänger", amount="Betrag")
@@ -1573,6 +1581,20 @@ async def pay(interaction: discord.Interaction, user: discord.Member, amount: in
         ephemeral=False
     )
 
+    await send_log(
+        interaction.guild,
+        category="economy",
+        title="💸 Pay",
+        color=discord.Color.blurple(),
+        user=interaction.user,
+        fields=[
+            ("Von", f"{interaction.user.mention} (`{sender_id}`)", False),
+            ("An", f"{user.mention} (`{recv_id}`)", False),
+            ("Betrag", str(amount), True),
+        ],
+        cooldown_key="pay",
+    )
+
 
 # ==================== Fun/Info Commands ====================
 @bot.tree.command(name="ping", description="Zeigt die Bot-Latenz")
@@ -1597,8 +1619,8 @@ async def helpme(interaction: discord.Interaction):
         "Moderation: /clear /kick /ban /timeout /mute /unmute /mute_setup\n"
         "Tickets: /ticket_setup /ticket create /ticket close\n"
         "Roles: /role_setup\n"
-        "Market: /market_setup_berlin /market_setup_poland\n"
         "Economy: /balance /daily /pay\n"
+        "History: /history user /history top /history clear\n"
         "Fun: /roll /coinflip /8ball\n"
         "Info: /ping /info /avatar /userinfo /serverinfo",
         ephemeral=True
@@ -1667,8 +1689,6 @@ async def eightball(interaction: discord.Interaction, frage: str):
 
 
 # ==================== Muted Message Enforcement ====================
-# Strikter als Permissions: wenn gemutet, dann darf user nur im UNMUTE channel
-# und in seinem eigenen Ticket schreiben (Topic user_id=...).
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -1701,7 +1721,6 @@ async def on_message(message: discord.Message):
             except Exception:
                 pass
 
-            # kurzer Hinweis (auto-delete)
             try:
                 warn = await message.channel.send(
                     f"🔇 {member.mention} du bist gemutet. Du darfst nur im <#{UNMUTE_CHANNEL_ID}> "
@@ -1712,7 +1731,7 @@ async def on_message(message: discord.Message):
             except Exception:
                 pass
 
-            return  # block processing
+            return
 
     await bot.process_commands(message)
 
@@ -1783,18 +1802,37 @@ async def auto_unmute_loop():
             finally:
                 conn2.close()
 
-            if did_unmute and member:
+            if did_unmute:
+                history_mark_unmuted(guild_id, user_id, unmuted_by=0, method="auto")
+
+            if did_unmute:
                 await send_log(
                     guild,
+                    category="mod",
                     title="⏱️ Auto-Unmute",
                     color=discord.Color.green(),
-                    user=member,
+                    user=member if member else None,
                     fields=[
-                        ("User", f"{member.mention} (`{member.id}`)", False),
+                        ("User", f"<@{user_id}> (`{user_id}`)", False),
                         ("Grund", "Timer abgelaufen", True),
                         ("Rollen restored", str(restored), True),
                         ("Rollen skipped", str(skipped), True),
                     ],
+                    cooldown_key=f"auto_unmute:{user_id}",
+                )
+
+                await send_log(
+                    guild,
+                    category="history",
+                    title="📜 Mute-History (Auto-Unmute eingetragen)",
+                    color=discord.Color.blurple(),
+                    user=member if member else None,
+                    fields=[
+                        ("User", f"<@{user_id}> (`{user_id}`)", False),
+                        ("Method", "`auto`", True),
+                        ("Zeit", _fmt_dt_short(now_utc().isoformat()), False),
+                    ],
+                    cooldown_key=f"history_auto:{user_id}",
                 )
 
 
@@ -1825,35 +1863,23 @@ async def on_member_join(member: discord.Member):
     jm = await detect_join_method(member.guild)
     join_method_cache[(member.guild.id, member.id)] = jm
 
-    log_ch = await get_log_channel(member.guild)
-    if log_ch:
-        emb = discord.Embed(title="Member joined", color=discord.Color.green())
-        emb.set_author(name=str(member), icon_url=member.display_avatar.url)
-        emb.set_thumbnail(url=member.display_avatar.url)
-        emb.add_field(
-            name="Joined Discord",
-            value=f"{member.created_at.strftime('%d.%m.%Y %H:%M')} • {discord_account_age(member)}",
-            inline=False
-        )
-        emb.add_field(name="User", value=f"{member.mention} ({member.id})", inline=False)
-
-        if jm["method"] == "vanity":
-            emb.add_field(name="Join method", value="Vanity Invite", inline=False)
-        elif jm["method"] == "invite":
-            inviter_txt = jm["inviter"].mention if jm["inviter"] else "Unbekannt"
-            emb.add_field(name="Join method", value=f"Invite `{jm['code']}` • invited by {inviter_txt}", inline=False)
-        else:
-            emb.add_field(name="Join method", value="Unknown (fehlende Invite-Rechte?)", inline=False)
-
-        await log_ch.send(embed=emb)
+    await send_log(
+        member.guild,
+        category="joinleave",
+        title="✅ Member joined",
+        color=discord.Color.green(),
+        user=member,
+        fields=[
+            ("User", f"{member.mention} (`{member.id}`)", False),
+            ("Joined Discord", f"{member.created_at.strftime('%d.%m.%Y %H:%M')} • {discord_account_age(member)}", False),
+            ("Join method", "Vanity Invite" if jm["method"] == "vanity" else (f"Invite `{jm['code']}`" if jm["method"] == "invite" else "Unknown"), False),
+        ],
+        cooldown_key="joinleave",
+    )
 
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    log_ch = await get_log_channel(member.guild)
-    if not log_ch:
-        return
-
     jm = join_method_cache.get((member.guild.id, member.id), {"method": "unknown", "code": None, "inviter": None})
     if jm["method"] == "vanity":
         join_txt = "Vanity Invite"
@@ -1863,13 +1889,19 @@ async def on_member_remove(member: discord.Member):
     else:
         join_txt = "Unknown"
 
-    emb = discord.Embed(title="Member left", color=discord.Color.red())
-    emb.set_author(name=str(member), icon_url=member.display_avatar.url)
-    emb.set_thumbnail(url=member.display_avatar.url)
-    emb.add_field(name="Roles", value=fmt_roles(member), inline=False)
-    emb.add_field(name="User", value=f"<@{member.id}> ({member.id})", inline=False)
-    emb.add_field(name="Joined via", value=join_txt, inline=False)
-    await log_ch.send(embed=emb)
+    await send_log(
+        member.guild,
+        category="joinleave",
+        title="❌ Member left",
+        color=discord.Color.red(),
+        user=member,
+        fields=[
+            ("User", f"<@{member.id}> (`{member.id}`)", False),
+            ("Roles", fmt_roles(member), False),
+            ("Joined via", join_txt, False),
+        ],
+        cooldown_key="joinleave",
+    )
 
 
 @bot.event
@@ -1881,9 +1913,6 @@ async def on_guild_join(guild: discord.Guild):
 async def on_ready():
     bot.add_view(TicketOpenView())
     bot.add_view(RolePanelView())
-    bot.add_view(MarketOpenViewBerlin())
-    bot.add_view(MarketOpenViewPoland())
-    bot.add_view(MarketListingView(disabled=False))
 
     if not auto_unmute_loop.is_running():
         auto_unmute_loop.start()
@@ -1897,6 +1926,17 @@ async def on_ready():
         await bot.tree.sync()
     except Exception as e:
         print("Sync error:", e)
+        # Best effort error log
+        for g in bot.guilds:
+            await send_log(
+                g,
+                category="error",
+                title="⚠️ Command Sync Error",
+                color=discord.Color.red(),
+                description=str(e),
+                ping_roles=True,
+                cooldown_key="sync_error",
+            )
 
 
 bot.run(TOKEN)
