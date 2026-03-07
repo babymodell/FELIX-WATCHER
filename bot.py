@@ -10,7 +10,6 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
-
 # ==================== ENV ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -1781,3 +1780,4 @@ async def on_ready():
 
 
 bot.run(TOKEN)
+
