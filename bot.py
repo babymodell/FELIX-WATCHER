@@ -1,3 +1,4 @@
+```py
 import os
 import io
 import asyncio
@@ -56,32 +57,32 @@ def env_bool(key: str, default: bool = True) -> bool:
     return v in ("1", "true", "yes", "y", "on")
 
 
-# REQUIRED FOR "WAY B" (guild sync)
-GUILD_ID = env_int("GUILD_ID")  # your server id (for instant slash updates)
+# REQUIRED FOR GUILD SYNC
+GUILD_ID = env_int("GUILD_ID")
 
 WELCOME_CHANNEL_ID = env_int("WELCOME_CHANNEL_ID")
 LOG_CHANNEL_ID = env_int("LOG_CHANNEL_ID")
 
-# Optional: separate log channels by category (falls nicht gesetzt -> LOG_CHANNEL_ID)
+# Optional category log channels
 LOG_CHANNEL_MOD_ID = env_int("LOG_CHANNEL_MOD_ID")
 LOG_CHANNEL_TICKET_ID = env_int("LOG_CHANNEL_TICKET_ID")
 LOG_CHANNEL_JOINLEAVE_ID = env_int("LOG_CHANNEL_JOINLEAVE_ID")
 LOG_CHANNEL_HISTORY_ID = env_int("LOG_CHANNEL_HISTORY_ID")
 LOG_CHANNEL_ERROR_ID = env_int("LOG_CHANNEL_ERROR_ID")
 
-# Optional: ping roles by category
+# Optional ping roles
 LOG_PING_MOD_ROLE_IDS = env_int_list("LOG_PING_MOD_ROLE_IDS")
 LOG_PING_TICKET_ROLE_IDS = env_int_list("LOG_PING_TICKET_ROLE_IDS")
 LOG_PING_ERROR_ROLE_IDS = env_int_list("LOG_PING_ERROR_ROLE_IDS")
 
-# Optional: toggles
+# Optional toggles
 LOG_ENABLE_MOD = env_bool("LOG_ENABLE_MOD", True)
 LOG_ENABLE_TICKET = env_bool("LOG_ENABLE_TICKET", True)
 LOG_ENABLE_JOINLEAVE = env_bool("LOG_ENABLE_JOINLEAVE", True)
 LOG_ENABLE_HISTORY = env_bool("LOG_ENABLE_HISTORY", True)
 LOG_ENABLE_ERROR = env_bool("LOG_ENABLE_ERROR", True)
 
-# Optional: log spam protection (seconds)
+# Optional log spam protection
 LOG_COOLDOWN_SECONDS = env_int("LOG_COOLDOWN_SECONDS") or 0
 
 TICKET_CATEGORY_ID = env_int("TICKET_CATEGORY_ID")
@@ -99,7 +100,7 @@ TRANSCRIPT_LIMIT = env_int("TICKET_TRANSCRIPT_LIMIT") or 200
 if not TOKEN:
     raise SystemExit("❌ DISCORD_BOT_TOKEN fehlt als Environment Variable.")
 if not GUILD_ID:
-    raise SystemExit("❌ GUILD_ID fehlt. (Für Weg B / instant Slash-Command Sync)")
+    raise SystemExit("❌ GUILD_ID fehlt. (Für instant Slash-Command Sync)")
 
 
 # ==================== DB ====================
@@ -153,9 +154,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 discord.utils.setup_logging()
 
 # ==================== Invite Tracking ====================
-invite_cache = defaultdict(dict)  # guild_id -> {code: uses}
+invite_cache = defaultdict(dict)
 vanity_cache = {}
-join_method_cache = {}  # (guild_id, user_id) -> dict(method=..., inviter=..., code=...)
+join_method_cache = {}
 
 # ==================== Helpers ====================
 def now_utc() -> datetime.datetime:
@@ -672,28 +673,86 @@ class RolePanelView(discord.ui.View):
 
     async def _toggle_role(self, interaction: discord.Interaction, role_id: int | None):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+            return await interaction.response.send_message("Only usable in a server.", ephemeral=True)
+
         if not role_id:
-            return await interaction.response.send_message("Role-ID fehlt in Env-Variablen.", ephemeral=True)
+            return await interaction.response.send_message("❌ Role ID is missing in env variables.", ephemeral=True)
 
-        role = interaction.guild.get_role(role_id)
-        if not role:
-            return await interaction.response.send_message("Rolle nicht gefunden. Prüfe Role-ID.", ephemeral=True)
-
+        guild = interaction.guild
         member = interaction.user
+        role = guild.get_role(role_id)
+
+        if not role:
+            return await interaction.response.send_message(
+                f"❌ Role not found.\nRole ID from env: `{role_id}`",
+                ephemeral=True
+            )
+
+        me = guild.me
+        if not me:
+            return await interaction.response.send_message("❌ Bot member not found.", ephemeral=True)
+
+        if not me.guild_permissions.manage_roles:
+            return await interaction.response.send_message(
+                "❌ Bot is missing **Manage Roles** permission.",
+                ephemeral=True
+            )
+
+        if me.top_role <= role:
+            return await interaction.response.send_message(
+                f"❌ I cannot manage {role.mention} because this role is higher than or equal to my highest role.\n"
+                f"My top role: {me.top_role.mention}\n"
+                f"Target role: {role.mention}",
+                ephemeral=True
+            )
+
+        if guild.owner_id != member.id and me.top_role <= member.top_role:
+            return await interaction.response.send_message(
+                f"❌ I cannot manage your roles because your highest role is above or equal to mine.\n"
+                f"Your top role: {member.top_role.mention}\n"
+                f"My top role: {me.top_role.mention}",
+                ephemeral=True
+            )
+
         try:
             if role in member.roles:
                 await member.remove_roles(role, reason="Role Panel toggle")
                 await interaction.response.send_message(f"❌ Role removed: {role.mention}", ephemeral=True)
-                await send_log(interaction.guild, category="mod", title="➖ Role removed (Panel)",
-                               color=discord.Color.red(), user=member, fields=[("Role", role.mention, True)])
+                await send_log(
+                    guild,
+                    category="mod",
+                    title="➖ Role removed (Panel)",
+                    color=discord.Color.red(),
+                    user=member,
+                    fields=[("Role", role.mention, True)],
+                )
             else:
                 await member.add_roles(role, reason="Role Panel toggle")
                 await interaction.response.send_message(f"✅ Role added: {role.mention}", ephemeral=True)
-                await send_log(interaction.guild, category="mod", title="➕ Role added (Panel)",
-                               color=discord.Color.green(), user=member, fields=[("Role", role.mention, True)])
-        except discord.Forbidden:
-            await interaction.response.send_message("❌ Missing permissions to manage roles.", ephemeral=True)
+                await send_log(
+                    guild,
+                    category="mod",
+                    title="➕ Role added (Panel)",
+                    color=discord.Color.green(),
+                    user=member,
+                    fields=[("Role", role.mention, True)],
+                )
+
+        except discord.Forbidden as e:
+            await interaction.response.send_message(
+                f"❌ Discord blocked the action.\nDetails: `{e}`",
+                ephemeral=True
+            )
+        except discord.HTTPException as e:
+            await interaction.response.send_message(
+                f"❌ Discord API error.\nDetails: `{e}`",
+                ephemeral=True
+            )
+        except Exception as e:
+            await interaction.response.send_message(
+                f"❌ Unexpected error.\nDetails: `{e}`",
+                ephemeral=True
+            )
 
     @discord.ui.button(label="Poland", style=discord.ButtonStyle.danger, emoji="🇵🇱", custom_id="rolepanel:poland")
     async def poland(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1424,7 +1483,7 @@ async def history_top_cmd(interaction: discord.Interaction, limit: int | None = 
 
 bot.tree.add_command(history_group)
 
-# ==================== Info Commands (kept) ====================
+# ==================== Info Commands ====================
 @bot.tree.command(name="ping", description="Show bot latency")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message(f"🏓 Pong: **{round(bot.latency * 1000)}ms**", ephemeral=True)
@@ -1500,11 +1559,9 @@ async def on_message(message: discord.Message):
     member = message.author
     muted_role = discord.utils.get(message.guild.roles, name=MUTED_ROLE_NAME)
     if muted_role and muted_role in member.roles:
-        # allow UNMUTE channel
         if UNMUTE_CHANNEL_ID and isinstance(message.channel, discord.TextChannel) and message.channel.id == UNMUTE_CHANNEL_ID:
             return await bot.process_commands(message)
 
-        # allow own ticket channel (topic user_id=member.id AND ticket category match)
         allowed = False
         if isinstance(message.channel, discord.TextChannel):
             try:
@@ -1701,10 +1758,9 @@ async def on_guild_join(guild: discord.Guild):
     await refresh_invites_for_guild(guild)
 
 
-# ==================== READY / SYNC (WAY B: Guild Sync) ====================
+# ==================== READY / SYNC ====================
 @bot.event
 async def on_ready():
-    # persistent views
     bot.add_view(TicketOpenView())
     bot.add_view(RolePanelView())
 
@@ -1716,7 +1772,6 @@ async def on_ready():
     for g in bot.guilds:
         await refresh_invites_for_guild(g)
 
-    # ✅ WAY B: instant slash command updates (guild sync)
     try:
         guild_obj = discord.Object(id=GUILD_ID)
         await bot.tree.sync(guild=guild_obj)
@@ -1726,3 +1781,4 @@ async def on_ready():
 
 
 bot.run(TOKEN)
+```
