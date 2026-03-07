@@ -1,4 +1,4 @@
-```py
+py
 import os
 import io
 import asyncio
@@ -1781,4 +1781,3 @@ async def on_ready():
 
 
 bot.run(TOKEN)
-```
