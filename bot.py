@@ -813,6 +813,8 @@ class RolePanelView(discord.ui.View):
             return await interaction.response.send_message("❌ Rolle nicht gefunden. Prüfe die Role-ID in der .env.", ephemeral=True)
 
         me = interaction.guild.get_member(interaction.client.user.id)
+        member = interaction.user
+
         if not me:
             return await interaction.response.send_message("❌ Bot member not found.", ephemeral=True)
 
@@ -825,13 +827,24 @@ class RolePanelView(discord.ui.View):
         if role.managed:
             return await interaction.response.send_message("❌ Diese Rolle wird von einer Integration verwaltet und kann nicht manuell vergeben werden.", ephemeral=True)
 
-        if not can_bot_manage_role(interaction.guild, role):
+        if me.top_role <= role:
             return await interaction.response.send_message(
-                f"❌ Bot-Rolle ist nicht hoch genug.\nBot top role: **{me.top_role}**\nZielrolle: **{role}**",
+                f"❌ Bot-Rolle ist nicht hoch genug für die Zielrolle.\n"
+                f"Bot top role: **{me.top_role}**\n"
+                f"Zielrolle: **{role}**",
                 ephemeral=True
             )
 
-        member = interaction.user
+        if member == interaction.guild.owner:
+            return await interaction.response.send_message("❌ Dem Server-Owner können keine Rollen per Bot geändert werden.", ephemeral=True)
+
+        if me.top_role <= member.top_role:
+            return await interaction.response.send_message(
+                f"❌ Bot-Rolle ist nicht hoch genug für diesen User.\n"
+                f"Bot top role: **{me.top_role}**\n"
+                f"User top role: **{member.top_role}**",
+                ephemeral=True
+            )
 
         try:
             if role in member.roles:
