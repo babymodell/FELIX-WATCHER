@@ -806,29 +806,63 @@ class RolePanelView(discord.ui.View):
             return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
 
         if not role_id:
-            return await interaction.response.send_message("Role-ID fehlt.", ephemeral=True)
+            return await interaction.response.send_message("❌ Role-ID fehlt in der .env.", ephemeral=True)
 
         role = interaction.guild.get_role(role_id)
+        if not role:
+            return await interaction.response.send_message("❌ Rolle nicht gefunden. Prüfe die Role-ID in der .env.", ephemeral=True)
+
         me = interaction.guild.get_member(interaction.client.user.id)
-
         if not me:
-            return await interaction.response.send_message("Bot member not found.", ephemeral=True)
+            return await interaction.response.send_message("❌ Bot member not found.", ephemeral=True)
 
-        lines = [
-            f"Bot user: {interaction.client.user} ({interaction.client.user.id})",
-            f"Bot member: {me} ({me.id})",
-            f"Target role id from env: {role_id}",
-            f"Target role found: {role.name if role else 'None'}",
-            f"Bot top role: {me.top_role.name} ({me.top_role.position})",
-            f"Bot has manage_roles: {me.guild_permissions.manage_roles}",
-            f"Bot has administrator: {me.guild_permissions.administrator}",
-        ]
+        if not me.guild_permissions.manage_roles and not me.guild_permissions.administrator:
+            return await interaction.response.send_message("❌ Bot hat keine Berechtigung `Manage Roles`.", ephemeral=True)
 
-        if role:
-            lines.append(f"Target role position: {role.position}")
-            lines.append(f"Can manage target: {me.top_role > role}")
+        if role.is_default():
+            return await interaction.response.send_message("❌ Die @everyone Rolle kann nicht vergeben werden.", ephemeral=True)
 
-        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        if role.managed:
+            return await interaction.response.send_message("❌ Diese Rolle wird von einer Integration verwaltet und kann nicht manuell vergeben werden.", ephemeral=True)
+
+        if not can_bot_manage_role(interaction.guild, role):
+            return await interaction.response.send_message(
+                f"❌ Bot-Rolle ist nicht hoch genug.\nBot top role: **{me.top_role}**\nZielrolle: **{role}**",
+                ephemeral=True
+            )
+
+        member = interaction.user
+
+        try:
+            if role in member.roles:
+                await member.remove_roles(role, reason="Role Panel toggle")
+                await interaction.response.send_message(f"❌ Rolle entfernt: {role.mention}", ephemeral=True)
+
+                await send_log(
+                    interaction.guild,
+                    category="mod",
+                    title="➖ Role removed (Panel)",
+                    color=discord.Color.red(),
+                    user=member,
+                    fields=[("Role", role.mention, True)],
+                )
+            else:
+                await member.add_roles(role, reason="Role Panel toggle")
+                await interaction.response.send_message(f"✅ Rolle hinzugefügt: {role.mention}", ephemeral=True)
+
+                await send_log(
+                    interaction.guild,
+                    category="mod",
+                    title="➕ Role added (Panel)",
+                    color=discord.Color.green(),
+                    user=member,
+                    fields=[("Role", role.mention, True)],
+                )
+
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ Discord hat die Rollenänderung blockiert (Forbidden).", ephemeral=True)
+        except discord.HTTPException as e:
+            await interaction.response.send_message(f"❌ Discord API Fehler: {e}", ephemeral=True)
 
     @discord.ui.button(label="Poland", style=discord.ButtonStyle.danger, emoji="🇵🇱", custom_id="rolepanel:poland")
     async def poland(self, interaction: discord.Interaction, button: discord.ui.Button):
