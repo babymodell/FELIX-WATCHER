@@ -1,15 +1,16 @@
-py
 import os
 import io
 import asyncio
 import sqlite3
 import datetime
+import traceback
 from collections import defaultdict
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
+
 # ==================== ENV ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -56,37 +57,32 @@ def env_bool(key: str, default: bool = True) -> bool:
     return v in ("1", "true", "yes", "y", "on")
 
 
-# REQUIRED FOR GUILD SYNC
 GUILD_ID = env_int("GUILD_ID")
 
 WELCOME_CHANNEL_ID = env_int("WELCOME_CHANNEL_ID")
 LOG_CHANNEL_ID = env_int("LOG_CHANNEL_ID")
 
-# Optional category log channels
 LOG_CHANNEL_MOD_ID = env_int("LOG_CHANNEL_MOD_ID")
 LOG_CHANNEL_TICKET_ID = env_int("LOG_CHANNEL_TICKET_ID")
 LOG_CHANNEL_JOINLEAVE_ID = env_int("LOG_CHANNEL_JOINLEAVE_ID")
 LOG_CHANNEL_HISTORY_ID = env_int("LOG_CHANNEL_HISTORY_ID")
 LOG_CHANNEL_ERROR_ID = env_int("LOG_CHANNEL_ERROR_ID")
 
-# Optional ping roles
 LOG_PING_MOD_ROLE_IDS = env_int_list("LOG_PING_MOD_ROLE_IDS")
 LOG_PING_TICKET_ROLE_IDS = env_int_list("LOG_PING_TICKET_ROLE_IDS")
 LOG_PING_ERROR_ROLE_IDS = env_int_list("LOG_PING_ERROR_ROLE_IDS")
 
-# Optional toggles
 LOG_ENABLE_MOD = env_bool("LOG_ENABLE_MOD", True)
 LOG_ENABLE_TICKET = env_bool("LOG_ENABLE_TICKET", True)
 LOG_ENABLE_JOINLEAVE = env_bool("LOG_ENABLE_JOINLEAVE", True)
 LOG_ENABLE_HISTORY = env_bool("LOG_ENABLE_HISTORY", True)
 LOG_ENABLE_ERROR = env_bool("LOG_ENABLE_ERROR", True)
 
-# Optional log spam protection
 LOG_COOLDOWN_SECONDS = env_int("LOG_COOLDOWN_SECONDS") or 0
 
 TICKET_CATEGORY_ID = env_int("TICKET_CATEGORY_ID")
 TICKET_PANEL_CHANNEL_ID = env_int("TICKET_PANEL_CHANNEL_ID")
-TICKET_STAFF_ROLE_IDS = env_int_list("TICKET_STAFF_ROLE_ID")
+TICKET_STAFF_ROLE_IDS = env_int_list("TICKET_STAFF_ROLE_IDS")
 
 UNMUTE_CHANNEL_ID = env_int("UNMUTE_CHANNEL_ID")
 
@@ -95,11 +91,12 @@ ROLE_POLAND_ID = env_int("ROLE_POLAND_ID")
 ROLE_GERMANY_ID = env_int("ROLE_GERMANY_ID")
 
 TRANSCRIPT_LIMIT = env_int("TICKET_TRANSCRIPT_LIMIT") or 200
+MUTE_ROLE_EXEMPT_IDS = env_int_list("MUTE_ROLE_EXEMPT_IDS")
 
 if not TOKEN:
     raise SystemExit("❌ DISCORD_BOT_TOKEN fehlt als Environment Variable.")
 if not GUILD_ID:
-    raise SystemExit("❌ GUILD_ID fehlt. (Für instant Slash-Command Sync)")
+    raise SystemExit("❌ GUILD_ID fehlt. (Für Guild Slash-Command Sync)")
 
 
 # ==================== DB ====================
@@ -142,15 +139,35 @@ def db():
             unmute_method TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS warnings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            moderator_id INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            warned_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ticket_counter (
+            guild_id INTEGER PRIMARY KEY,
+            last_number INTEGER NOT NULL
+        )
+    """)
     return conn
 
 
 # ==================== BOT ====================
 intents = discord.Intents.default()
 intents.members = True
+intents.guilds = True
+intents.messages = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 discord.utils.setup_logging()
+
+ticket_create_lock = asyncio.Lock()
 
 # ==================== Invite Tracking ====================
 invite_cache = defaultdict(dict)
@@ -170,6 +187,44 @@ def _fmt_dt_short(iso: str | None) -> str:
         return f"<t:{int(dt.timestamp())}:f> (<t:{int(dt.timestamp())}:R>)"
     except Exception:
         return iso
+
+
+def get_bot_member(guild: discord.Guild) -> discord.Member | None:
+    if bot.user is None:
+        return None
+    return guild.get_member(bot.user.id)
+
+
+def can_bot_manage_role(guild: discord.Guild, role: discord.Role) -> bool:
+    if role.is_default() or role.managed:
+        return False
+    me = get_bot_member(guild)
+    if not me:
+        return False
+    return me.top_role > role
+
+
+def actor_can_moderate_target(actor: discord.Member, target: discord.Member) -> tuple[bool, str | None]:
+    if actor.guild.owner_id == actor.id:
+        return True, None
+    if target.id == actor.id:
+        return False, "❌ You cannot target yourself."
+    if target.id == actor.guild.owner_id:
+        return False, "❌ You cannot target the server owner."
+    if target.top_role >= actor.top_role:
+        return False, "❌ This user has an equal or higher role than you."
+    return True, None
+
+
+def bot_can_moderate_target(guild: discord.Guild, target: discord.Member) -> tuple[bool, str | None]:
+    me = get_bot_member(guild)
+    if not me:
+        return False, "❌ Bot member not found in guild cache."
+    if target.id == guild.owner_id:
+        return False, "❌ I cannot target the server owner."
+    if target.top_role >= me.top_role:
+        return False, "❌ Bot role is too low for this user."
+    return True, None
 
 
 def parse_duration_to_minutes(text: str | None) -> int | None:
@@ -212,18 +267,20 @@ def parse_duration_to_minutes(text: str | None) -> int | None:
     raise ValueError("Ungültiges Format. Beispiele: 30m, 2h, 1d, perm")
 
 
+def parse_timeout_duration(text: str) -> datetime.timedelta:
+    minutes = parse_duration_to_minutes(text)
+    if minutes is None:
+        raise ValueError("Timeout darf nicht permanent sein. Beispiele: 10m, 1h, 1d")
+    if minutes > 40320:
+        raise ValueError("Discord timeout max ist 28 Tage.")
+    return datetime.timedelta(minutes=minutes)
+
+
 async def get_text_channel(guild: discord.Guild, channel_id: int | None) -> discord.TextChannel | None:
     if not channel_id:
         return None
     ch = guild.get_channel(channel_id)
     return ch if isinstance(ch, discord.TextChannel) else None
-
-
-def has_role(member: discord.Member, role_id: int | None) -> bool:
-    if not role_id:
-        return False
-    r = member.guild.get_role(role_id)
-    return bool(r and r in member.roles)
 
 
 def is_staff(member: discord.Member) -> bool:
@@ -253,7 +310,7 @@ def fmt_roles(member: discord.Member, limit: int = 18) -> str:
     if not roles:
         return "—"
     if len(roles) > limit:
-        return " ".join(roles[:limit]) + f" …(+{len(roles)-limit})"
+        return " ".join(roles[:limit]) + f" …(+{len(roles) - limit})"
     return " ".join(roles)
 
 
@@ -458,7 +515,22 @@ async def send_log(
         pass
 
 
-# ==================== Mute Role Backup Helpers ====================
+async def send_error_log(guild: discord.Guild | None, title: str, description: str, user: discord.abc.User | None = None):
+    if guild is None:
+        return
+    await send_log(
+        guild,
+        category="error",
+        title=title,
+        description=description[:4000],
+        color=discord.Color.red(),
+        user=user,
+        ping_roles=True,
+        cooldown_key=f"error:{title}:{getattr(user, 'id', 0)}",
+    )
+
+
+# ==================== Mute Backup ====================
 def _serialize_role_ids(role_ids: list[int]) -> str:
     return ",".join(str(r) for r in role_ids)
 
@@ -503,16 +575,7 @@ def pop_mute_roles_backup(guild_id: int, user_id: int) -> list[int]:
         conn.close()
 
 
-def can_bot_manage_role(guild: discord.Guild, role: discord.Role) -> bool:
-    if role.is_default() or role.managed:
-        return False
-    me = guild.me
-    if not me:
-        return False
-    return me.top_role > role
-
-
-# ==================== Mute History Helpers ====================
+# ==================== Mute History ====================
 def history_add_mute(guild_id: int, user_id: int, moderator_id: int, reason: str, duration_minutes: int | None):
     conn = db()
     try:
@@ -608,6 +671,57 @@ def history_top(guild_id: int, limit: int = 10) -> list[tuple[int, int]]:
         conn.close()
 
 
+# ==================== Warnings ====================
+def warning_add(guild_id: int, user_id: int, moderator_id: int, reason: str):
+    conn = db()
+    try:
+        conn.execute(
+            """
+            INSERT INTO warnings(guild_id, user_id, moderator_id, reason, warned_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (guild_id, user_id, moderator_id, reason, now_utc().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def warning_fetch(guild_id: int, user_id: int, limit: int = 10) -> tuple[int, list[tuple]]:
+    conn = db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, moderator_id, reason, warned_at
+            FROM warnings
+            WHERE guild_id=? AND user_id=?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (guild_id, user_id, int(limit)),
+        ).fetchall()
+        total = conn.execute(
+            "SELECT COUNT(*) FROM warnings WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id),
+        ).fetchone()[0]
+        return int(total), rows
+    finally:
+        conn.close()
+
+
+def warning_clear_user(guild_id: int, user_id: int) -> int:
+    conn = db()
+    try:
+        cur = conn.execute(
+            "DELETE FROM warnings WHERE guild_id=? AND user_id=?",
+            (guild_id, user_id),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+    finally:
+        conn.close()
+
+
 # ==================== Ticket Helpers ====================
 async def ensure_ticket_category(guild: discord.Guild) -> discord.CategoryChannel:
     if not TICKET_CATEGORY_ID:
@@ -618,12 +732,29 @@ async def ensure_ticket_category(guild: discord.Guild) -> discord.CategoryChanne
     return cat
 
 
-async def next_ticket_number(guild: discord.Guild) -> int:
-    n = 1
-    existing = {c.name for c in guild.text_channels}
-    while f"ticket-{n}" in existing:
-        n += 1
-    return n
+def next_ticket_number_db(guild_id: int) -> int:
+    conn = db()
+    try:
+        row = conn.execute(
+            "SELECT last_number FROM ticket_counter WHERE guild_id=?",
+            (guild_id,),
+        ).fetchone()
+        if row is None:
+            new_num = 1
+            conn.execute(
+                "INSERT INTO ticket_counter(guild_id, last_number) VALUES (?, ?)",
+                (guild_id, new_num),
+            )
+        else:
+            new_num = int(row[0]) + 1
+            conn.execute(
+                "UPDATE ticket_counter SET last_number=? WHERE guild_id=?",
+                (new_num, guild_id),
+            )
+        conn.commit()
+        return new_num
+    finally:
+        conn.close()
 
 
 # ==================== Mute System ====================
@@ -672,53 +803,25 @@ class RolePanelView(discord.ui.View):
 
     async def _toggle_role(self, interaction: discord.Interaction, role_id: int | None):
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            return await interaction.response.send_message("Only usable in a server.", ephemeral=True)
-
+            return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
         if not role_id:
-            return await interaction.response.send_message("❌ Role ID is missing in env variables.", ephemeral=True)
+            return await interaction.response.send_message("Role-ID fehlt in Env-Variablen.", ephemeral=True)
 
-        guild = interaction.guild
-        member = interaction.user
-        role = guild.get_role(role_id)
-
+        role = interaction.guild.get_role(role_id)
         if not role:
-            return await interaction.response.send_message(
-                f"❌ Role not found.\nRole ID from env: `{role_id}`",
-                ephemeral=True
-            )
+            return await interaction.response.send_message("Rolle nicht gefunden. Prüfe Role-ID.", ephemeral=True)
 
-        me = guild.me
-        if not me:
-            return await interaction.response.send_message("❌ Bot member not found.", ephemeral=True)
+        me = get_bot_member(interaction.guild)
+        if not me or role >= me.top_role:
+            return await interaction.response.send_message("❌ Bot role is too low to manage this role.", ephemeral=True)
 
-        if not me.guild_permissions.manage_roles:
-            return await interaction.response.send_message(
-                "❌ Bot is missing **Manage Roles** permission.",
-                ephemeral=True
-            )
-
-        if me.top_role <= role:
-            return await interaction.response.send_message(
-                f"❌ I cannot manage {role.mention} because this role is higher than or equal to my highest role.\n"
-                f"My top role: {me.top_role.mention}\n"
-                f"Target role: {role.mention}",
-                ephemeral=True
-            )
-
-        if guild.owner_id != member.id and me.top_role <= member.top_role:
-            return await interaction.response.send_message(
-                f"❌ I cannot manage your roles because your highest role is above or equal to mine.\n"
-                f"Your top role: {member.top_role.mention}\n"
-                f"My top role: {me.top_role.mention}",
-                ephemeral=True
-            )
-
+        member = interaction.user
         try:
             if role in member.roles:
                 await member.remove_roles(role, reason="Role Panel toggle")
                 await interaction.response.send_message(f"❌ Role removed: {role.mention}", ephemeral=True)
                 await send_log(
-                    guild,
+                    interaction.guild,
                     category="mod",
                     title="➖ Role removed (Panel)",
                     color=discord.Color.red(),
@@ -729,29 +832,15 @@ class RolePanelView(discord.ui.View):
                 await member.add_roles(role, reason="Role Panel toggle")
                 await interaction.response.send_message(f"✅ Role added: {role.mention}", ephemeral=True)
                 await send_log(
-                    guild,
+                    interaction.guild,
                     category="mod",
                     title="➕ Role added (Panel)",
                     color=discord.Color.green(),
                     user=member,
                     fields=[("Role", role.mention, True)],
                 )
-
-        except discord.Forbidden as e:
-            await interaction.response.send_message(
-                f"❌ Discord blocked the action.\nDetails: `{e}`",
-                ephemeral=True
-            )
-        except discord.HTTPException as e:
-            await interaction.response.send_message(
-                f"❌ Discord API error.\nDetails: `{e}`",
-                ephemeral=True
-            )
-        except Exception as e:
-            await interaction.response.send_message(
-                f"❌ Unexpected error.\nDetails: `{e}`",
-                ephemeral=True
-            )
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ Missing permissions to manage roles.", ephemeral=True)
 
     @discord.ui.button(label="Poland", style=discord.ButtonStyle.danger, emoji="🇵🇱", custom_id="rolepanel:poland")
     async def poland(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -769,7 +858,7 @@ class TicketManageView(discord.ui.View):
         self.ticket_owner_id = ticket_owner_id
 
     async def _update_status_embed(self, channel: discord.TextChannel, status_text: str):
-        me = channel.guild.me
+        me = get_bot_member(channel.guild)
         async for msg in channel.history(limit=25):
             if me and msg.author.id == me.id and msg.embeds:
                 emb = msg.embeds[0]
@@ -806,8 +895,10 @@ class TicketManageView(discord.ui.View):
             title="🔒 Ticket closed",
             color=discord.Color.red(),
             user=interaction.user,
-            fields=[("Channel", f"#{ch.name} (`{ch.id}`)", False),
-                    ("Closed by", f"{interaction.user.mention} (`{interaction.user.id}`)", False)],
+            fields=[
+                ("Channel", f"#{ch.name} (`{ch.id}`)", False),
+                ("Closed by", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
+            ],
             file=f,
         )
 
@@ -856,8 +947,10 @@ class TicketManageView(discord.ui.View):
             title="🧾 Ticket claimed",
             color=discord.Color.gold(),
             user=interaction.user,
-            fields=[("Channel", f"{ch.mention} (`{ch.id}`)", False),
-                    ("Claimed by", f"{interaction.user.mention} (`{interaction.user.id}`)", False)],
+            fields=[
+                ("Channel", f"{ch.mention} (`{ch.id}`)", False),
+                ("Claimed by", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
+            ],
         )
 
 
@@ -877,32 +970,37 @@ class TicketOpenView(discord.ui.View):
         except Exception as e:
             return await interaction.response.send_message(f"❌ {e}", ephemeral=True)
 
-        for ch in category.text_channels:
-            if ch.topic and f"user_id={member.id}" in ch.topic:
-                return await interaction.response.send_message(f"You already have a ticket: {ch.mention}", ephemeral=True)
+        async with ticket_create_lock:
+            for ch in category.text_channels:
+                if ch.topic and f"user_id={member.id}" in ch.topic:
+                    return await interaction.response.send_message(f"You already have a ticket: {ch.mention}", ephemeral=True)
 
-        ticket_no = await next_ticket_number(guild)
-        channel_name = f"ticket-{ticket_no}"
+            ticket_no = next_ticket_number_db(guild.id)
+            channel_name = f"ticket-{ticket_no}"
 
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True),
-        }
+            me = get_bot_member(guild)
+            if not me:
+                return await interaction.response.send_message("❌ Bot member not found.", ephemeral=True)
 
-        staff_roles = [guild.get_role(rid) for rid in TICKET_STAFF_ROLE_IDS]
-        staff_roles = [r for r in staff_roles if r is not None]
-        for r in staff_roles:
-            overwrites[r] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+                me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True),
+            }
 
-        topic = f"ticket_type={kind} | user_id={member.id} | claimed_by=none"
-        ch = await guild.create_text_channel(
-            name=channel_name,
-            category=category,
-            overwrites=overwrites,
-            topic=topic,
-            reason=f"Ticket created by {member} ({kind})",
-        )
+            staff_roles = [guild.get_role(rid) for rid in TICKET_STAFF_ROLE_IDS]
+            staff_roles = [r for r in staff_roles if r is not None]
+            for r in staff_roles:
+                overwrites[r] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+            topic = f"ticket_type={kind} | user_id={member.id} | claimed_by=none"
+            ch = await guild.create_text_channel(
+                name=channel_name,
+                category=category,
+                overwrites=overwrites,
+                topic=topic,
+                reason=f"Ticket created by {member} ({kind})",
+            )
 
         embed = discord.Embed(
             title="Tickets",
@@ -914,8 +1012,7 @@ class TicketOpenView(discord.ui.View):
         embed.set_thumbnail(url=member.display_avatar.url)
 
         staff_ping = " ".join(r.mention for r in staff_roles)
-
-        await ch.send(content=staff_ping, embed=embed, view=TicketManageView(ticket_owner_id=member.id))
+        await ch.send(content=staff_ping or None, embed=embed, view=TicketManageView(ticket_owner_id=member.id))
         await interaction.response.send_message(f"✅ Ticket created: {ch.mention}", ephemeral=True)
 
         await send_log(
@@ -926,7 +1023,7 @@ class TicketOpenView(discord.ui.View):
             user=member,
             fields=[("Channel", f"{ch.mention} (`{ch.id}`)", False), ("Type", kind, True)],
             ping_roles=True,
-            cooldown_key="ticket_created",
+            cooldown_key=f"ticket_created:{member.id}",
         )
 
     @discord.ui.button(label="Question", style=discord.ButtonStyle.secondary, emoji="❓", custom_id="ticket_open:question")
@@ -988,7 +1085,7 @@ async def role_setup(interaction: discord.Interaction):
     await interaction.response.send_message(f"✅ Role panel posted in {ch.mention}", ephemeral=True)
 
 
-# ==================== Ticket Commands Group ====================
+# ==================== Ticket Commands ====================
 ticket_group = app_commands.Group(name="ticket", description="Ticket Commands")
 
 
@@ -1007,7 +1104,7 @@ async def ticket_create(interaction: discord.Interaction, typ: str):
         await interaction.response.send_message("❌ Invalid type. Use: Question / Recruitment / Partnership", ephemeral=True)
 
 
-@ticket_group.command(name="close", description="Close this ticket (deletes channel)")
+@ticket_group.command(name="close", description="Close this ticket")
 async def ticket_close(interaction: discord.Interaction):
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
@@ -1032,8 +1129,10 @@ async def ticket_close(interaction: discord.Interaction):
         title="🔒 Ticket closed",
         color=discord.Color.red(),
         user=interaction.user,
-        fields=[("Channel", f"#{ch.name} (`{ch.id}`)", False),
-                ("Closed by", f"{interaction.user.mention} (`{interaction.user.id}`)", False)],
+        fields=[
+            ("Channel", f"#{ch.name} (`{ch.id}`)", False),
+            ("Closed by", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
+        ],
         file=f,
     )
 
@@ -1045,6 +1144,232 @@ async def ticket_close(interaction: discord.Interaction):
 
 
 bot.tree.add_command(ticket_group)
+
+# ==================== History Commands ====================
+history_group = app_commands.Group(name="history", description="Mute history commands")
+
+
+@history_group.command(name="user", description="Show mute history for a user")
+@staff_check()
+@app_commands.describe(user="User", limit="How many entries (1-20)")
+async def history_user(interaction: discord.Interaction, user: discord.Member, limit: int | None = 10):
+    if not interaction.guild:
+        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+
+    limit = max(1, min(20, int(limit or 10)))
+    total, rows = history_fetch(interaction.guild.id, user.id, limit=limit)
+
+    if total == 0:
+        return await interaction.response.send_message(f"📜 No mute history for {user.mention}.", ephemeral=True)
+
+    emb = discord.Embed(
+        title="📜 Mute History",
+        description=f"User: {user.mention} (`{user.id}`)\nTotal mutes: **{total}**\nShowing last **{len(rows)}**:",
+        color=discord.Color.orange(),
+    )
+    emb.set_thumbnail(url=user.display_avatar.url)
+
+    for idx, (moderator_id, reason, muted_at, duration_minutes, unmuted_at, unmuted_by, unmute_method) in enumerate(rows, start=1):
+        mod_txt = f"<@{int(moderator_id)}>" if moderator_id else "—"
+        reason_txt = reason or "—"
+        dur_txt = f"{duration_minutes} min" if duration_minutes else "permanent"
+        muted_txt = _fmt_dt_short(muted_at)
+
+        if unmuted_at:
+            um_txt = _fmt_dt_short(unmuted_at)
+            um_by = f"<@{int(unmuted_by)}>" if unmuted_by else "—"
+            um_method = unmute_method or "—"
+            status = f"✅ Unmuted: {um_txt}\nBy: {um_by} • Method: `{um_method}`"
+        else:
+            status = "🔇 Still active/open (no unmute saved)"
+
+        emb.add_field(
+            name=f"#{idx} • {muted_txt}",
+            value=(
+                f"Moderator: {mod_txt}\n"
+                f"Duration: **{dur_txt}**\n"
+                f"Reason: {reason_txt}\n"
+                f"{status}"
+            ),
+            inline=False,
+        )
+
+    await interaction.response.send_message(embed=emb, ephemeral=True)
+
+
+@history_group.command(name="clear", description="Clear mute history for a user")
+@staff_check()
+@app_commands.describe(user="User")
+async def history_clear(interaction: discord.Interaction, user: discord.Member):
+    if not interaction.guild:
+        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+
+    deleted = history_clear_user(interaction.guild.id, user.id)
+    await interaction.response.send_message(
+        f"🧹 Cleared mute history for {user.mention}: **{deleted}** entries.",
+        ephemeral=True,
+    )
+
+    await send_log(
+        interaction.guild,
+        category="history",
+        title="🧹 Mute history cleared",
+        color=discord.Color.red(),
+        user=interaction.user,
+        fields=[("User", f"{user.mention} (`{user.id}`)", False), ("Deleted", str(deleted), True)],
+        cooldown_key=f"history_clear:{user.id}",
+    )
+
+
+@history_group.command(name="top", description="Top muted users")
+@staff_check()
+@app_commands.describe(limit="How many (1-20)")
+async def history_top_cmd(interaction: discord.Interaction, limit: int | None = 10):
+    if not interaction.guild:
+        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+
+    limit = max(1, min(20, int(limit or 10)))
+    top = history_top(interaction.guild.id, limit=limit)
+
+    if not top:
+        return await interaction.response.send_message("📊 No mute history found.", ephemeral=True)
+
+    emb = discord.Embed(
+        title="📊 Mute Top List",
+        description=f"Top **{len(top)}** (by mute count)",
+        color=discord.Color.orange(),
+    )
+
+    lines = []
+    for i, (uid, cnt) in enumerate(top, start=1):
+        m = interaction.guild.get_member(uid)
+        mention = m.mention if m else f"<@{uid}>"
+        lines.append(f"**#{i}** {mention} — **{cnt}**")
+
+    emb.add_field(name="Ranking", value="\n".join(lines), inline=False)
+    await interaction.response.send_message(embed=emb, ephemeral=True)
+
+
+bot.tree.add_command(history_group)
+
+# ==================== Warning Commands ====================
+warn_group = app_commands.Group(name="warn", description="Warning commands")
+
+
+@warn_group.command(name="add", description="Warn a user")
+@staff_check()
+@app_commands.describe(user="User", grund="Reason")
+async def warn_add(interaction: discord.Interaction, user: discord.Member, grund: str):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+
+    allowed, msg = actor_can_moderate_target(interaction.user, user)
+    if not allowed:
+        return await interaction.response.send_message(msg, ephemeral=True)
+
+    allowed, msg = bot_can_moderate_target(interaction.guild, user)
+    if not allowed:
+        return await interaction.response.send_message(msg, ephemeral=True)
+
+    grund = (grund or "").strip()
+    if not grund:
+        return await interaction.response.send_message("❌ Reason is required.", ephemeral=True)
+
+    warning_add(interaction.guild.id, user.id, interaction.user.id, grund)
+
+    try:
+        await user.send(
+            f"⚠️ You were warned on **{interaction.guild.name}**.\n"
+            f"👮 By: {interaction.user}\n"
+            f"📝 Reason: {grund}"
+        )
+    except Exception:
+        pass
+
+    total, _ = warning_fetch(interaction.guild.id, user.id, limit=1)
+
+    await interaction.response.send_message(
+        f"⚠️ {user.mention} warned. Total warnings: **{total}**",
+        ephemeral=True,
+    )
+
+    await send_log(
+        interaction.guild,
+        category="mod",
+        title="⚠️ Warning issued",
+        color=discord.Color.yellow(),
+        user=user,
+        fields=[
+            ("User", f"{user.mention} (`{user.id}`)", False),
+            ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
+            ("Reason", grund, False),
+            ("Total warnings", str(total), True),
+        ],
+        cooldown_key=f"warn_add:{user.id}",
+    )
+
+
+@warn_group.command(name="list", description="Show warnings for a user")
+@staff_check()
+@app_commands.describe(user="User", limit="How many entries (1-20)")
+async def warn_list(interaction: discord.Interaction, user: discord.Member, limit: int | None = 10):
+    if not interaction.guild:
+        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+
+    limit = max(1, min(20, int(limit or 10)))
+    total, rows = warning_fetch(interaction.guild.id, user.id, limit=limit)
+
+    if total == 0:
+        return await interaction.response.send_message(f"⚠️ No warnings for {user.mention}.", ephemeral=True)
+
+    emb = discord.Embed(
+        title="⚠️ Warning History",
+        description=f"User: {user.mention} (`{user.id}`)\nTotal warnings: **{total}**\nShowing last **{len(rows)}**:",
+        color=discord.Color.yellow(),
+    )
+    emb.set_thumbnail(url=user.display_avatar.url)
+
+    for wid, moderator_id, reason, warned_at in rows:
+        emb.add_field(
+            name=f"#{wid} • {_fmt_dt_short(warned_at)}",
+            value=(
+                f"Moderator: <@{int(moderator_id)}>\n"
+                f"Reason: {reason}"
+            ),
+            inline=False,
+        )
+
+    await interaction.response.send_message(embed=emb, ephemeral=True)
+
+
+@warn_group.command(name="clear", description="Clear all warnings for a user")
+@staff_check()
+@app_commands.describe(user="User")
+async def warn_clear(interaction: discord.Interaction, user: discord.Member):
+    if not interaction.guild:
+        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+
+    deleted = warning_clear_user(interaction.guild.id, user.id)
+    await interaction.response.send_message(
+        f"🧹 Cleared warnings for {user.mention}: **{deleted}** entries.",
+        ephemeral=True,
+    )
+
+    await send_log(
+        interaction.guild,
+        category="mod",
+        title="🧹 Warnings cleared",
+        color=discord.Color.red(),
+        user=interaction.user,
+        fields=[
+            ("User", f"{user.mention} (`{user.id}`)", False),
+            ("Deleted", str(deleted), True),
+        ],
+        cooldown_key=f"warn_clear:{user.id}",
+    )
+
+
+bot.tree.add_command(warn_group)
 
 # ==================== Moderation Commands ====================
 @bot.tree.command(name="clear", description="Delete messages (max 100)")
@@ -1080,6 +1405,14 @@ async def kick(interaction: discord.Interaction, user: discord.Member, grund: st
     if not interaction.user.guild_permissions.kick_members and not is_staff(interaction.user):
         return await interaction.response.send_message("❌ Missing permission (Kick Members).", ephemeral=True)
 
+    allowed, msg = actor_can_moderate_target(interaction.user, user)
+    if not allowed:
+        return await interaction.response.send_message(msg, ephemeral=True)
+
+    allowed, msg = bot_can_moderate_target(interaction.guild, user)
+    if not allowed:
+        return await interaction.response.send_message(msg, ephemeral=True)
+
     grund = grund or "—"
     try:
         await user.kick(reason=f"{grund} | by {interaction.user}")
@@ -1091,9 +1424,11 @@ async def kick(interaction: discord.Interaction, user: discord.Member, grund: st
             title="👢 Kick",
             color=discord.Color.orange(),
             user=user,
-            fields=[("User", f"{user.mention} (`{user.id}`)", False),
-                    ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
-                    ("Reason", grund, False)],
+            fields=[
+                ("User", f"{user.mention} (`{user.id}`)", False),
+                ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
+                ("Reason", grund, False),
+            ],
         )
     except discord.Forbidden:
         await interaction.response.send_message("❌ Bot missing permission to kick.", ephemeral=True)
@@ -1107,6 +1442,14 @@ async def ban(interaction: discord.Interaction, user: discord.Member, grund: str
     if not interaction.user.guild_permissions.ban_members and not is_staff(interaction.user):
         return await interaction.response.send_message("❌ Missing permission (Ban Members).", ephemeral=True)
 
+    allowed, msg = actor_can_moderate_target(interaction.user, user)
+    if not allowed:
+        return await interaction.response.send_message(msg, ephemeral=True)
+
+    allowed, msg = bot_can_moderate_target(interaction.guild, user)
+    if not allowed:
+        return await interaction.response.send_message(msg, ephemeral=True)
+
     grund = grund or "—"
     try:
         await user.ban(reason=f"{grund} | by {interaction.user}")
@@ -1118,12 +1461,167 @@ async def ban(interaction: discord.Interaction, user: discord.Member, grund: str
             title="⛔ Ban",
             color=discord.Color.red(),
             user=user,
-            fields=[("User", f"{user.mention} (`{user.id}`)", False),
-                    ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
-                    ("Reason", grund, False)],
+            fields=[
+                ("User", f"{user.mention} (`{user.id}`)", False),
+                ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
+                ("Reason", grund, False),
+            ],
         )
     except discord.Forbidden:
         await interaction.response.send_message("❌ Bot missing permission to ban.", ephemeral=True)
+
+
+@bot.tree.command(name="banid", description="Ban a user by ID")
+@staff_check()
+@app_commands.describe(user_id="User ID", grund="Reason")
+async def banid(interaction: discord.Interaction, user_id: str, grund: str):
+    if not interaction.guild:
+        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+
+    user_id = user_id.strip()
+    if not user_id.isdigit():
+        return await interaction.response.send_message("❌ Invalid user ID.", ephemeral=True)
+
+    uid = int(user_id)
+    if uid == interaction.user.id:
+        return await interaction.response.send_message("❌ You cannot target yourself.", ephemeral=True)
+
+    grund = (grund or "").strip() or "—"
+
+    try:
+        user_obj = await bot.fetch_user(uid)
+        await interaction.guild.ban(user_obj, reason=f"{grund} | by {interaction.user}")
+        await interaction.response.send_message(f"✅ Banned user ID `{uid}`. Reason: {grund}", ephemeral=True)
+
+        await send_log(
+            interaction.guild,
+            category="mod",
+            title="⛔ Ban by ID",
+            color=discord.Color.red(),
+            user=interaction.user,
+            fields=[
+                ("Target ID", str(uid), True),
+                ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
+                ("Reason", grund, False),
+            ],
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Bot missing permission to ban.", ephemeral=True)
+    except discord.NotFound:
+        await interaction.response.send_message("❌ User not found.", ephemeral=True)
+    except discord.HTTPException as e:
+        await interaction.response.send_message(f"❌ Ban failed: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="timeout", description="Timeout a user")
+@app_commands.describe(user="User", dauer="e.g. 10m, 1h, 1d", grund="Reason")
+@staff_check()
+async def timeout_cmd(interaction: discord.Interaction, user: discord.Member, dauer: str, grund: str):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+
+    allowed, msg = actor_can_moderate_target(interaction.user, user)
+    if not allowed:
+        return await interaction.response.send_message(msg, ephemeral=True)
+
+    allowed, msg = bot_can_moderate_target(interaction.guild, user)
+    if not allowed:
+        return await interaction.response.send_message(msg, ephemeral=True)
+
+    grund = (grund or "").strip()
+    if not grund:
+        return await interaction.response.send_message("❌ Reason is required.", ephemeral=True)
+
+    try:
+        delta = parse_timeout_duration(dauer)
+    except ValueError as e:
+        return await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+
+    try:
+        until = now_utc() + delta
+        await user.edit(timed_out_until=until, reason=f"{grund} | by {interaction.user}")
+        await interaction.response.send_message(
+            f"⏳ {user.mention} timed out for **{dauer}**. Reason: **{grund}**",
+            ephemeral=True,
+        )
+
+        try:
+            await user.send(
+                f"⏳ You were timed out on **{interaction.guild.name}**.\n"
+                f"👮 By: {interaction.user}\n"
+                f"📝 Reason: {grund}\n"
+                f"⏱️ Duration: {dauer}"
+            )
+        except Exception:
+            pass
+
+        await send_log(
+            interaction.guild,
+            category="mod",
+            title="⏳ Timeout applied",
+            color=discord.Color.orange(),
+            user=user,
+            fields=[
+                ("User", f"{user.mention} (`{user.id}`)", False),
+                ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
+                ("Duration", dauer, True),
+                ("Reason", grund, False),
+            ],
+            cooldown_key=f"timeout:{user.id}",
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Bot missing permission to timeout this user.", ephemeral=True)
+
+
+@bot.tree.command(name="untimeout", description="Remove timeout from a user")
+@app_commands.describe(user="User", grund="Reason")
+@staff_check()
+async def untimeout_cmd(interaction: discord.Interaction, user: discord.Member, grund: str):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+
+    allowed, msg = actor_can_moderate_target(interaction.user, user)
+    if not allowed:
+        return await interaction.response.send_message(msg, ephemeral=True)
+
+    allowed, msg = bot_can_moderate_target(interaction.guild, user)
+    if not allowed:
+        return await interaction.response.send_message(msg, ephemeral=True)
+
+    grund = (grund or "").strip()
+    if not grund:
+        return await interaction.response.send_message("❌ Reason is required.", ephemeral=True)
+
+    try:
+        await user.edit(timed_out_until=None, reason=f"{grund} | by {interaction.user}")
+        await interaction.response.send_message(
+            f"✅ Timeout removed for {user.mention}. Reason: **{grund}**",
+            ephemeral=True,
+        )
+
+        try:
+            await user.send(
+                f"✅ Your timeout was removed on **{interaction.guild.name}**.\n"
+                f"📝 Reason: {grund}"
+            )
+        except Exception:
+            pass
+
+        await send_log(
+            interaction.guild,
+            category="mod",
+            title="✅ Timeout removed",
+            color=discord.Color.green(),
+            user=user,
+            fields=[
+                ("User", f"{user.mention} (`{user.id}`)", False),
+                ("Moderator", f"{interaction.user.mention} (`{interaction.user.id}`)", False),
+                ("Reason", grund, False),
+            ],
+            cooldown_key=f"untimeout:{user.id}",
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Bot missing permission to edit timeout.", ephemeral=True)
 
 
 # ==================== Mute Commands ====================
@@ -1143,12 +1641,20 @@ async def mute_setup(interaction: discord.Interaction):
     await interaction.followup.send("✅ Mute setup done (Muted role & overwrites).", ephemeral=True)
 
 
-@bot.tree.command(name="mute", description="Mute a user (only unmute-channel + own tickets writable)")
+@bot.tree.command(name="mute", description="Mute a user")
 @staff_check()
-@app_commands.describe(user="User", dauer="Duration e.g. 30m, 2h, 1d, perm (or number=minutes)", grund="Reason (optional)")
+@app_commands.describe(user="User", dauer="e.g. 30m, 2h, 1d, perm", grund="Reason (optional)")
 async def mute(interaction: discord.Interaction, user: discord.Member, dauer: str | None = None, grund: str | None = None):
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+
+    allowed, msg = actor_can_moderate_target(interaction.user, user)
+    if not allowed:
+        return await interaction.response.send_message(msg, ephemeral=True)
+
+    allowed, msg = bot_can_moderate_target(interaction.guild, user)
+    if not allowed:
+        return await interaction.response.send_message(msg, ephemeral=True)
 
     await interaction.response.defer(ephemeral=True)
 
@@ -1182,6 +1688,8 @@ async def mute(interaction: discord.Interaction, user: discord.Member, dauer: st
         if r.is_default():
             continue
         if r.id == muted_role.id:
+            continue
+        if r.id in MUTE_ROLE_EXEMPT_IDS:
             continue
 
         backup_role_ids.append(r.id)
@@ -1224,7 +1732,7 @@ async def mute(interaction: discord.Interaction, user: discord.Member, dauer: st
 
     unmute_ch = interaction.guild.get_channel(UNMUTE_CHANNEL_ID)
     unmute_hint = f"#{unmute_ch.name}" if isinstance(unmute_ch, discord.TextChannel) else "the unmute channel"
-    dauer_txt = (f"{minutes} minutes" if minutes is not None else "permanent")
+    dauer_txt = f"{minutes} minutes" if minutes is not None else "permanent"
 
     try:
         await user.send(
@@ -1243,7 +1751,7 @@ async def mute(interaction: discord.Interaction, user: discord.Member, dauer: st
     if cannot_remove:
         cannot_txt = " ".join(r.mention for r in cannot_remove[:20])
         if len(cannot_remove) > 20:
-            cannot_txt += f" …(+{len(cannot_remove)-20})"
+            cannot_txt += f" …(+{len(cannot_remove) - 20})"
 
     await send_log(
         interaction.guild,
@@ -1281,12 +1789,20 @@ async def mute(interaction: discord.Interaction, user: discord.Member, dauer: st
     )
 
 
-@bot.tree.command(name="unmute", description="Unmute a user (reason required)")
+@bot.tree.command(name="unmute", description="Unmute a user")
 @staff_check()
 @app_commands.describe(user="User", grund="Reason (required)")
 async def unmute(interaction: discord.Interaction, user: discord.Member, grund: str):
-    if not interaction.guild:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
+
+    allowed, msg = actor_can_moderate_target(interaction.user, user)
+    if not allowed:
+        return await interaction.response.send_message(msg, ephemeral=True)
+
+    allowed, msg = bot_can_moderate_target(interaction.guild, user)
+    if not allowed:
+        return await interaction.response.send_message(msg, ephemeral=True)
 
     grund = (grund or "").strip()
     if not grund:
@@ -1375,113 +1891,6 @@ async def unmute(interaction: discord.Interaction, user: discord.Member, grund: 
     )
 
 
-# ==================== History Commands ====================
-history_group = app_commands.Group(name="history", description="History Commands")
-
-
-@history_group.command(name="user", description="Show mute history for a user")
-@staff_check()
-@app_commands.describe(user="User", limit="How many entries (1-20)")
-async def history_user(interaction: discord.Interaction, user: discord.Member, limit: int | None = 10):
-    if not interaction.guild:
-        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
-
-    limit = max(1, min(20, int(limit or 10)))
-    total, rows = history_fetch(interaction.guild.id, user.id, limit=limit)
-
-    if total == 0:
-        return await interaction.response.send_message(f"📜 No mute history for {user.mention}.", ephemeral=True)
-
-    emb = discord.Embed(
-        title="📜 Mute History",
-        description=f"User: {user.mention} (`{user.id}`)\nTotal mutes: **{total}**\nShowing last **{len(rows)}**:",
-        color=discord.Color.orange(),
-    )
-    emb.set_thumbnail(url=user.display_avatar.url)
-
-    for idx, (moderator_id, reason, muted_at, duration_minutes, unmuted_at, unmuted_by, unmute_method) in enumerate(rows, start=1):
-        mod_txt = f"<@{int(moderator_id)}>" if moderator_id else "—"
-        reason_txt = (reason or "—")
-        dur_txt = f"{duration_minutes} min" if duration_minutes else "permanent"
-        muted_txt = _fmt_dt_short(muted_at)
-
-        if unmuted_at:
-            um_txt = _fmt_dt_short(unmuted_at)
-            um_by = f"<@{int(unmuted_by)}>" if unmuted_by else "—"
-            um_method = unmute_method or "—"
-            status = f"✅ Unmuted: {um_txt}\nBy: {um_by} • Method: `{um_method}`"
-        else:
-            status = "🔇 Still active/open (no unmute saved)"
-
-        emb.add_field(
-            name=f"#{idx} • {muted_txt}",
-            value=(
-                f"Moderator: {mod_txt}\n"
-                f"Duration: **{dur_txt}**\n"
-                f"Reason: {reason_txt}\n"
-                f"{status}"
-            ),
-            inline=False,
-        )
-
-    await interaction.response.send_message(embed=emb, ephemeral=True)
-
-
-@history_group.command(name="clear", description="Clear mute history for a user")
-@staff_check()
-@app_commands.describe(user="User")
-async def history_clear(interaction: discord.Interaction, user: discord.Member):
-    if not interaction.guild:
-        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
-
-    deleted = history_clear_user(interaction.guild.id, user.id)
-    await interaction.response.send_message(
-        f"🧹 Cleared mute history for {user.mention}: **{deleted}** entries.",
-        ephemeral=True,
-    )
-
-    await send_log(
-        interaction.guild,
-        category="history",
-        title="🧹 Mute history cleared",
-        color=discord.Color.red(),
-        user=interaction.user,
-        fields=[("User", f"{user.mention} (`{user.id}`)", False), ("Deleted", str(deleted), True)],
-        cooldown_key=f"history_clear:{user.id}",
-    )
-
-
-@history_group.command(name="top", description="Top 10 most muted users")
-@staff_check()
-@app_commands.describe(limit="How many (1-20)")
-async def history_top_cmd(interaction: discord.Interaction, limit: int | None = 10):
-    if not interaction.guild:
-        return await interaction.response.send_message("Nur im Server nutzbar.", ephemeral=True)
-
-    limit = max(1, min(20, int(limit or 10)))
-    top = history_top(interaction.guild.id, limit=limit)
-
-    if not top:
-        return await interaction.response.send_message("📊 No mute history found.", ephemeral=True)
-
-    emb = discord.Embed(
-        title="📊 Mute Top List",
-        description=f"Top **{len(top)}** (by mute count)",
-        color=discord.Color.orange(),
-    )
-
-    lines = []
-    for i, (uid, cnt) in enumerate(top, start=1):
-        m = interaction.guild.get_member(uid)
-        mention = m.mention if m else f"<@{uid}>"
-        lines.append(f"**#{i}** {mention} — **{cnt}**")
-
-    emb.add_field(name="Ranking", value="\n".join(lines), inline=False)
-    await interaction.response.send_message(embed=emb, ephemeral=True)
-
-
-bot.tree.add_command(history_group)
-
 # ==================== Info Commands ====================
 @bot.tree.command(name="ping", description="Show bot latency")
 async def ping(interaction: discord.Interaction):
@@ -1515,6 +1924,7 @@ async def userinfo(interaction: discord.Interaction, user: discord.Member | None
     emb.add_field(name="Joined Server", value=user.joined_at.strftime("%d.%m.%Y %H:%M") if user.joined_at else "—", inline=False)
     emb.add_field(name="Created", value=user.created_at.strftime("%d.%m.%Y %H:%M"), inline=False)
     emb.add_field(name="Roles", value=fmt_roles(user), inline=False)
+    emb.add_field(name="Timed out", value="Yes" if user.is_timed_out() else "No", inline=True)
     await interaction.response.send_message(embed=emb, ephemeral=True)
 
 
@@ -1537,7 +1947,7 @@ async def serverinfo(interaction: discord.Interaction):
 async def helpme(interaction: discord.Interaction):
     await interaction.response.send_message(
         "✅ **Commands**\n"
-        "Moderation: /clear /kick /ban /mute /unmute /mute_setup\n"
+        "Moderation: /clear /kick /ban /banid /warn add /warn list /warn clear /timeout /untimeout /mute /unmute /mute_setup\n"
         "Tickets: /ticket_setup /ticket create /ticket close\n"
         "Roles: /role_setup\n"
         "History: /history user /history top /history clear\n"
@@ -1558,18 +1968,27 @@ async def on_message(message: discord.Message):
     member = message.author
     muted_role = discord.utils.get(message.guild.roles, name=MUTED_ROLE_NAME)
     if muted_role and muted_role in member.roles:
-        if UNMUTE_CHANNEL_ID and isinstance(message.channel, discord.TextChannel) and message.channel.id == UNMUTE_CHANNEL_ID:
-            return await bot.process_commands(message)
+        channel = message.channel
+
+        if UNMUTE_CHANNEL_ID:
+            if isinstance(channel, discord.TextChannel) and channel.id == UNMUTE_CHANNEL_ID:
+                return await bot.process_commands(message)
+            if isinstance(channel, discord.Thread) and channel.parent_id == UNMUTE_CHANNEL_ID:
+                return await bot.process_commands(message)
 
         allowed = False
-        if isinstance(message.channel, discord.TextChannel):
-            try:
-                topic_data = parse_topic(message.channel.topic)
+        try:
+            base_channel = channel
+            if isinstance(channel, discord.Thread):
+                base_channel = channel.parent
+
+            if isinstance(base_channel, discord.TextChannel):
+                topic_data = parse_topic(base_channel.topic)
                 owner_id = int(topic_data.get("user_id", "0") or 0)
-                if owner_id == member.id and (TICKET_CATEGORY_ID is None or message.channel.category_id == TICKET_CATEGORY_ID):
+                if owner_id == member.id and (TICKET_CATEGORY_ID is None or base_channel.category_id == TICKET_CATEGORY_ID):
                     allowed = True
-            except Exception:
-                allowed = False
+        except Exception:
+            allowed = False
 
         if not allowed:
             try:
@@ -1578,7 +1997,7 @@ async def on_message(message: discord.Message):
                 pass
 
             try:
-                warn = await message.channel.send(
+                warn = await channel.send(
                     f"🔇 {member.mention} you are muted. You can only write in <#{UNMUTE_CHANNEL_ID}> "
                     f"and in **your own** ticket channels."
                 )
@@ -1586,7 +2005,6 @@ async def on_message(message: discord.Message):
                 await warn.delete()
             except Exception:
                 pass
-
             return
 
     await bot.process_commands(message)
@@ -1722,7 +2140,7 @@ async def on_member_join(member: discord.Member):
             ("Joined Discord", f"{member.created_at.strftime('%d.%m.%Y %H:%M')} • {discord_account_age(member)}", False),
             ("Join method", "Vanity Invite" if jm["method"] == "vanity" else (f"Invite `{jm['code']}`" if jm["method"] == "invite" else "Unknown"), False),
         ],
-        cooldown_key="joinleave",
+        cooldown_key=f"join:{member.id}",
     )
 
 
@@ -1744,17 +2162,75 @@ async def on_member_remove(member: discord.Member):
         color=discord.Color.red(),
         user=member,
         fields=[
-            ("User", f"<@{member.id}> (`{member.id}`)", False),
+            ("User", f"{member} (`{member.id}`)", False),
             ("Roles", fmt_roles(member), False),
             ("Joined via", join_txt, False),
         ],
-        cooldown_key="joinleave",
+        cooldown_key=f"leave:{member.id}",
     )
+
+    join_method_cache.pop((member.guild.id, member.id), None)
 
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
     await refresh_invites_for_guild(guild)
+
+
+# ==================== Error Handling ====================
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    try:
+        if isinstance(error, app_commands.CheckFailure):
+            if interaction.response.is_done():
+                await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
+            else:
+                await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+            return
+
+        err_text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+
+        if interaction.response.is_done():
+            await interaction.followup.send("❌ An internal error occurred.", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ An internal error occurred.", ephemeral=True)
+
+        await send_error_log(
+            interaction.guild,
+            "⚠️ App command error",
+            f"Command: `{getattr(interaction.command, 'qualified_name', 'unknown')}`\n```py\n{err_text[:3500]}\n```",
+            interaction.user,
+        )
+    except Exception:
+        pass
+
+
+@bot.event
+async def on_error(event, *args, **kwargs):
+    err_text = traceback.format_exc()
+    guild = None
+    user = None
+
+    for obj in list(args) + list(kwargs.values()):
+        if isinstance(obj, discord.Interaction):
+            guild = obj.guild
+            user = obj.user
+            break
+        if isinstance(obj, discord.Message):
+            guild = obj.guild
+            user = obj.author
+            break
+        if isinstance(obj, discord.Member):
+            guild = obj.guild
+            user = obj
+            break
+
+    await send_error_log(
+        guild,
+        f"⚠️ Event error: {event}",
+        f"```py\n{err_text[:3500]}\n```",
+        user,
+    )
 
 
 # ==================== READY / SYNC ====================
@@ -1780,4 +2256,3 @@ async def on_ready():
 
 
 bot.run(TOKEN)
-
